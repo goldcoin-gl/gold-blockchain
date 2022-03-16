@@ -26,6 +26,7 @@ class HarvesterAPI:
     harvester: Harvester
 
     def __init__(self, harvester: Harvester):
+        self.currentDiff = 20
         self.harvester = harvester
 
     def _set_state_changed_callback(self, callback: Callable):
@@ -175,6 +176,7 @@ class HarvesterAPI:
                     return filename, []
             else:
                 difficulty_coeff = Decimal(1)
+            self.currentDiff = difficulty_coeff
 
             proofs_of_space_and_q: List[Tuple[bytes32, ProofOfSpace]] = await loop.run_in_executor(
                 self.harvester.executor, blocking_lookup, filename, plot_info, difficulty_coeff
@@ -246,7 +248,7 @@ class HarvesterAPI:
         self.harvester.log.info(
             f"{len(awaitables)} plots were eligible for farming {new_challenge.challenge_hash.hex()[:10]}..."
             f" Found {total_proofs_found} proofs. Time: {time.time() - start:.5f} s. "
-            f"Total {self.harvester.plot_manager.plot_count()} plots"
+            f"Total {self.harvester.plot_manager.plot_count()} plots at {self.currentDiff}"
         )
 
     @api_request
