@@ -269,7 +269,7 @@ async def summary(
                     ph = create_puzzlehash_for_pk(hexstr_to_bytes(plot["farmer_public_key"]))
                     PlotStats.staking_addresses[ph] += 1
                     if PlotStats.staking_addresses[ph] ==1:
-                        wal = encode_puzzle_hash(ph, "sit")
+                        wal = encode_puzzle_hash(ph, "gl")
                         print(f"Staking address {wal} for Farmer {plot['farmer_public_key']}")
                 print(f"   {len(plots['plots'])} plots of size: {format_bytes(total_plot_size_harvester)}")
 
