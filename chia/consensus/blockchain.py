@@ -1022,9 +1022,9 @@ class Blockchain(BlockchainInterface):
                     coeff = Decimal("0.5") + Decimal(1) / (Decimal(staking) / space + 1)
                 else:
                     coeff = Decimal("0.05") + Decimal(1) / (Decimal(staking) / space + Decimal("0.05"))
-
+        _mojo_per_chia = 1000000000000
         log.info(
-            f"minimal_staking : {minimal_staking}, space : {space} "
+            f"minimal_staking : {minimal_staking/_mojo_per_chia}, space : {space} "
             f"Difficulty coefficient: {coeff}, staking: {staking}, total space: {network_space}, "
             f"blocks: {blocks}, peak_height: {peak_height}"
             )
