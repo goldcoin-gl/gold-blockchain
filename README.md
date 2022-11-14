@@ -1,4 +1,4 @@
-# gold blockchain (Gold)
+# gold blockchain (www.gold.cab) 
 
 ![IMG_4734](https://github.com/goldcoin-gl/gold-blockchain-gui/raw/main/src/assets/img/chia_circle.png)
 
