@@ -18,7 +18,7 @@
 Please visit our wiki for more information:
 [wiki](https://github.com/goldcoin-gl/gold-blockchain/wiki).
 
-DOWnload [Gold blockchain database](https://www.gold.cab/download)
+Download [Gold blockchain database](https://www.gold.cab/download)
 
 
 ## How to staking
