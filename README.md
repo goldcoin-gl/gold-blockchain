@@ -1,4 +1,4 @@
-# gold blockchain currency (www.gold.cab) 
+# gold blockchain currency (www.gold.gl) 
 
 ![IMG_4734](https://avatars.githubusercontent.com/u/98028987?v=4)
  
