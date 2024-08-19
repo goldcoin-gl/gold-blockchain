@@ -1,4 +1,4 @@
-# gold blockchain currency (www.gold.gl) 
+# gl coin (www.glcoin.net) 
 
 ![IMG_4734](https://avatars.githubusercontent.com/u/98028987?v=4)
  
