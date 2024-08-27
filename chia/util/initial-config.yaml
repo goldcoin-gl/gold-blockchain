@@ -1,56 +1,75 @@
-min_mainnet_k_size: 31
+min_mainnet_k_size: 32
 
 # Send a ping to all peers after ping_interval seconds
 ping_interval: 120
 self_hostname: &self_hostname "localhost"
+prefer_ipv6: False
+rpc_timeout: 300
 daemon_port: 55524
 daemon_max_message_size: 50000000 # maximum size of RPC message in bytes
+daemon_heartbeat: 300 # sets the heartbeat for ping/ping interval and timeouts
+daemon_allow_tls_1_2: False # if True, allow TLS 1.2 for daemon connections
 inbound_rate_limit_percent: 100
 outbound_rate_limit_percent: 30
 
 network_overrides: &network_overrides
   constants:
     mainnet:
-      NETWORK_TYPE: 1
       GENESIS_CHALLENGE: b1e8f9ee96413b512aeb7e4a07142427e3e7c5e1c8be2242ecdc1537b523eb30
-      DIFFICULTY_STARTING: 7
-      EPOCH_BLOCKS: 768
-      SUB_SLOT_ITERS_STARTING: 33554432
+      GENESIS_PRE_FARM_FARMER_PUZZLE_HASH: df62080c2648f32317da68a4dfa82b8ee09280278598366864475989d6a9a12e
+      GENESIS_PRE_FARM_POOL_PUZZLE_HASH: 1154e73194bc5479dd029fef922b2aa1a0cc1bbc383c756f5ff8040dadcac4bb
     testnet:
-      NETWORK_TYPE: 1
       GENESIS_CHALLENGE: 004d5ce5d9f46a7bbfdc76b5750ac7875b5f9c582417dab1a2fcf4b3efc4c9af
-      SUB_SLOT_ITERS_STARTING: 33554432
-      EPOCH_BLOCKS: 768
-      DIFFICULTY_STARTING: 7
+      GENESIS_PRE_FARM_FARMER_PUZZLE_HASH: df62080c2648f32317da68a4dfa82b8ee09280278598366864475989d6a9a12e
+      GENESIS_PRE_FARM_POOL_PUZZLE_HASH: 1154e73194bc5479dd029fef922b2aa1a0cc1bbc383c756f5ff8040dadcac4bb
     testnet7:
-      NETWORK_TYPE: 1
       GENESIS_CHALLENGE: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-      SUB_SLOT_ITERS_STARTING: 33554432
-      EPOCH_BLOCKS: 768
+      GENESIS_PRE_FARM_FARMER_PUZZLE_HASH: df62080c2648f32317da68a4dfa82b8ee09280278598366864475989d6a9a12e
+      GENESIS_PRE_FARM_POOL_PUZZLE_HASH: 1154e73194bc5479dd029fef922b2aa1a0cc1bbc383c756f5ff8040dadcac4bb
       DIFFICULTY_STARTING: 1
     devnet:
-      NETWORK_TYPE: 1
       GENESIS_CHALLENGE: 312a8236f87e1ddd09269d5ae4bab8c20b9b77e0fe64bbd317053b9efc64da91
-      SUB_SLOT_ITERS_STARTING: 33554432
-      EPOCH_BLOCKS: 768
+      GENESIS_PRE_FARM_FARMER_PUZZLE_HASH: df62080c2648f32317da68a4dfa82b8ee09280278598366864475989d6a9a12e
+      GENESIS_PRE_FARM_POOL_PUZZLE_HASH: 1154e73194bc5479dd029fef922b2aa1a0cc1bbc383c756f5ff8040dadcac4bb
       DIFFICULTY_STARTING: 1
-      STAKING_ESTIMATE_BLOCK_RANGE: 768
       BLOCKS_CACHE_SIZE: 1152
       NUMBER_ZERO_BITS_PLOT_FILTER: 5
+    testnet11:
+      AGG_SIG_ME_ADDITIONAL_DATA: 37a90eb5185a9c4439a91ddc98bbadce7b4feba060d50116a067de66bf236615
+      DIFFICULTY_CONSTANT_FACTOR: 10052721566054
+      DIFFICULTY_STARTING: 30
+      GENESIS_CHALLENGE: 37a90eb5185a9c4439a91ddc98bbadce7b4feba060d50116a067de66bf236615
+      GENESIS_PRE_FARM_FARMER_PUZZLE_HASH: df62080c2648f32317da68a4dfa82b8ee09280278598366864475989d6a9a12e
+      GENESIS_PRE_FARM_POOL_PUZZLE_HASH: 1154e73194bc5479dd029fef922b2aa1a0cc1bbc383c756f5ff8040dadcac4bb
+      MEMPOOL_BLOCK_BUFFER: 10
+      MIN_PLOT_SIZE: 18
+      NETWORK_TYPE: 1
+      SUB_SLOT_ITERS_STARTING: 67108864
+      # Forks activated from the beginning on this network
+      HARD_FORK_HEIGHT: 0
+      HARD_FORK_FIX_HEIGHT: 0
+      SOFT_FORK4_HEIGHT: 641500
+      SOFT_FORK5_HEIGHT: 1340000
+      PLOT_FILTER_128_HEIGHT: 6029568
+      PLOT_FILTER_64_HEIGHT: 11075328
+      PLOT_FILTER_32_HEIGHT: 16121088
   config:
     mainnet:
       address_prefix: "gl"
       default_full_node_port: 14444
-    testnet:
+    testnet0:
       address_prefix: "tgl"
       default_full_node_port: 54444
     devnet:
       address_prefix: "dgl"
       default_full_node_port: 54445
+    testnet11:
+      address_prefix: "tgl"
+      default_full_node_port: 54444
 
 selected_network: &selected_network "mainnet"
-ALERTS_URL: https://download.chia.net/notify/mainnet_alert.txt
-CHIA_ALERTS_PUBKEY: 89b7fd87cb56e926ecefb879a29aae308be01f31980569f6a75a69d2a9a69daefd71fb778d865f7c50d6c967e3025937
+ALERTS_URL: https://download.glcoin.net/notify/mainnet_alert.txt
+GOLD_ALERTS_PUBKEY: 89b7fd87cb56e926ecefb879a29aae308be01f31980569f6a75a69d2a9a69daefd71fb778d865f7c50d6c967e3025937
 
 # public ssl ca is included in source code
 # Private ssl ca is used for trusted connections between machines user owns
@@ -58,32 +77,69 @@ private_ssl_ca:
   crt: "config/ssl/ca/private_ca.crt"
   key: "config/ssl/ca/private_ca.key"
 
-chia_ssl_ca:
-  crt: "config/ssl/ca/chia_ca.crt"
-  key: "config/ssl/ca/chia_ca.key"
-
+gold_ssl_ca:
+  crt: "config/ssl/ca/gold_ca.crt"
+  key: "config/ssl/ca/gold_ca.key"
 
 daemon_ssl:
   private_crt: "config/ssl/daemon/private_daemon.crt"
   private_key: "config/ssl/daemon/private_daemon.key"
 
-
-# Controls logging of all servers (harvester, farmer, etc..). Each one can be overriden.
+# Controls logging of all servers (harvester, farmer, etc..). Each one can be overridden.
 logging: &logging
-  log_stdout: False  # If True, outputs to stdout instead of a file
+  log_stdout: False # If True, outputs to stdout instead of a file
   log_filename: "log/debug.log"
-  log_level: "INFO"  # Can be CRITICAL, ERROR, WARNING, INFO, DEBUG, NOTSET
+  log_level: "WARNING" # Can be CRITICAL, ERROR, WARNING, INFO, DEBUG, NOTSET
   log_maxfilesrotation: 7 #  Max files in rotation. Default value 7 if the key is not set
-  log_syslog: False  # If True, outputs to SysLog host and port specified
-  log_syslog_host: "localhost"  # Send logging messages to a remote or local Unix syslog
-  log_syslog_port: 514  # UDP port of the remote or local Unix syslog
+  log_maxbytesrotation: 52428800 #  Max bytes logged before rotating logs
+  log_use_gzip: False #  Use gzip to compress rotated logs
+  log_syslog: False # If True, outputs to SysLog host and port specified
+  log_syslog_host: "localhost" # Send logging messages to a remote or local Unix syslog
+  log_syslog_port: 514 # UDP port of the remote or local Unix syslog
+
+seeder:
+  # The fake full node used for crawling will run on this port.
+  port: 14444
+  # Most full nodes on the network run on this port. (i.e. 14444 for mainnet, 54444 for testnet).
+  other_peers_port: 14444
+  # What port to run the DNS server on, (this is useful if you are already using port 53 for DNS).
+  dns_port: 53
+  # This will override the default full_node.peer_connect_timeout for the crawler full node
+  peer_connect_timeout: 2
+  # Path to crawler DB. Defaults to $GOLD_ROOT/crawler.db
+  crawler_db_path: "crawler.db"
+  # Peers used for the initial run.
+  bootstrap_peers:
+    - "node.glcoin.net"
+  # Only consider nodes synced at least to this height.
+  minimum_height: 240000
+  # How many of a particular version we need to see before reporting it in the logs
+  minimum_version_count: 100
+  domain_name: "seeder.example.com."
+  nameserver: "example.com."
+  ttl: 300
+  soa:
+    rname: "hostmaster.example.com" # all @ symbols need to be replaced with . in dns records.
+    serial_number: 1619105223
+    refresh: 10800
+    retry: 10800
+    expire: 604800
+    minimum: 1800
+  network_overrides: *network_overrides
+  selected_network: *selected_network
+  logging: *logging
+  # Crawler is its own standalone service within the seeder component
+  crawler:
+    start_rpc_server: True
+    rpc_port: 14561
+    ssl:
+      private_crt: "config/ssl/crawler/private_crawler.crt"
+      private_key: "config/ssl/crawler/private_crawler.key"
 
 harvester:
-  # The harvester server (if run) will run on this port
-  port: 14448
-  farmer_peer:
-    host: *self_hostname
-    port: 14447
+  farmer_peers:
+    - host: *self_hostname
+      port: 14447
 
   # If True, starts an RPC server at the following port
   start_rpc_server: True
@@ -95,7 +151,6 @@ harvester:
     batch_size: 300 # How many plot files the harvester processes before it waits batch_sleep_milliseconds
     batch_sleep_milliseconds: 1 # Milliseconds the harvester sleeps between batch processing
 
-
   # If True use parallel reads in chiapos
   parallel_read: True
 
@@ -105,46 +160,62 @@ harvester:
 
   # Plots are searched for in the following directories
   plot_directories: []
+  recursive_plot_scan: False # If True the harvester scans plots recursively in the provided directories.
 
   ssl:
-    private_crt:  "config/ssl/harvester/private_harvester.crt"
-    private_key:  "config/ssl/harvester/private_harvester.key"
+    private_crt: "config/ssl/harvester/private_harvester.crt"
+    private_key: "config/ssl/harvester/private_harvester.key"
 
   private_ssl_ca:
     crt: "config/ssl/ca/private_ca.crt"
     key: "config/ssl/ca/private_ca.key"
 
-  chia_ssl_ca:
-    crt: "config/ssl/ca/chia_ca.crt"
-    key: "config/ssl/ca/chia_ca.key"
+  gold_ssl_ca:
+    crt: "config/ssl/ca/gold_ca.crt"
+    key: "config/ssl/ca/gold_ca.key"
+
+  # Compressed harvesting.
+  parallel_decompressor_count: 0
+  # If set to 0, `decompressor_thread_count` will default to half of nproc available on the machine.
+  # A non-zero number overrides this default.
+  decompressor_thread_count: 0
+  disable_cpu_affinity: False
+  # Ignore compressed plots with compression level greater than this.
+  max_compression_level_allowed: 7
+  use_gpu_harvesting: False
+  gpu_index: 0
+  enforce_gpu_index: False
+  # If no decompressor is available after `decompressor_timeout` seconds, abort the current operation.
+  decompressor_timeout: 20
 
 pool:
-  # Replace this with a real puzzle hash
+  # Replace this with a real receive address
   # gl_target_address: tgl102gkhhzs60grx7cfnpng5n6rjecr89r86l5s8xux2za8k820cxsq64ssdg
   logging: *logging
   network_overrides: *network_overrides
   selected_network: *selected_network
 
-
 farmer:
   # The farmer server (if run) will run on this port
   port: 14447
-  # The farmer will attempt to connect to this full node and harvester
-  full_node_peer:
-    host: *self_hostname
-    port: 14444
-  harvester_peer:
-    host: *self_hostname
-    port: 14448
+  # The farmer will attempt to connect to these full nodes
+  full_node_peers:
+    - host: *self_hostname
+      port: 14444
 
   pool_public_keys: []
 
-  # Replace this with a real puzzle hash
+  # Replace this with a real receive address
   # gl_target_address: tgl102gkhhzs60grx7cfnpng5n6rjecr89r86l5s8xux2za8k820cxsq64ssdg
 
   # If True, starts an RPC server at the following port
   start_rpc_server: True
   rpc_port: 14559
+
+  # when enabled, the farmer will print a pstats profile to the
+  # root_dir/profile-farmer directory every second.
+  # analyze with python -m chia.util.profiler <path>
+  enable_profiler: False
 
   # To send a share to a pool, a proof of space must have required_iters less than this number
   pool_share_threshold: 1000
@@ -153,10 +224,10 @@ farmer:
   selected_network: *selected_network
 
   ssl:
-    private_crt:  "config/ssl/farmer/private_farmer.crt"
-    private_key:  "config/ssl/farmer/private_farmer.key"
-    public_crt:  "config/ssl/farmer/public_farmer.crt"
-    public_key:  "config/ssl/farmer/public_farmer.key"
+    private_crt: "config/ssl/farmer/private_farmer.crt"
+    private_key: "config/ssl/farmer/private_farmer.key"
+    public_crt: "config/ssl/farmer/public_farmer.crt"
+    public_key: "config/ssl/farmer/public_farmer.key"
 
 # Don't run this unless you want to run VDF clients on the local machine.
 timelord_launcher:
@@ -167,10 +238,7 @@ timelord_launcher:
   process_count: 3
   logging: *logging
 
-
 timelord:
-  # The timelord server (if run) will run on this port
-  port: 14446
   # Provides a list of VDF clients expected to connect to this timelord.
   # For each client, an IP is provided, together with the estimated iterations per second.
   vdf_clients:
@@ -180,8 +248,8 @@ timelord:
       - 127.0.0.1
     ips_estimate:
       - 150000
-  full_node_peer:
-      host: *self_hostname
+  full_node_peers:
+    - host: *self_hostname
       port: 14444
   # Maximum number of seconds allowed for a client to reconnect to the server.
   max_connection_time: 60
@@ -195,29 +263,42 @@ timelord:
   # fast_algorithm is a faster proof generation algorithm. This speed increase
   # requires much less memory usage and a does not have the risk of OOM that
   # the normal timelord has but requires significantly more cores doing
-  # parrallel proof generation and creates a larger and slower to verify
+  # parallel proof generation and creates a larger and slower to verify
   # resulting proof.
   # An Intel Core i9-10900K can run 2 normal vdf_clients at ~221,000 ips
   # without slowing down but running more than 1 with fast_algorithm will
   # run each vdf_client slower.
   fast_algorithm: False
-  # Bluebox (sanatizing Timelord):
+  # Bluebox (sanitizing timelord):
   # If set 'True', the timelord will create compact proofs of time, instead of
   # extending the chain. The attribute 'fast_algorithm' won't apply if timelord
-  # is running in sanitizer_mode.
+  # is running in bluebox_mode.
   # You must set 'send_uncompact_interval' in 'full_node' > 0 in the full_node
   # section below to have full_node send existing time proofs to be sanitized.
-  sanitizer_mode: False
+  bluebox_mode: False
+  # This runs a less CPU intensive bluebox. Runs for windows. Settings apply as for `bluebox_mode`.
+  # Optionally set `process_count` in `timelord_launcher` to 0, since timelord launcher won't be used in this case.
+  # IMPORTANT! `bluebox_mode` must also be set to True for this option to work.
+  slow_bluebox: False
+  # If `slow_bluebox` is True, launches `slow_bluebox_process_count` processes.
+  slow_bluebox_process_count: 1
+
+  multiprocessing_start_method: default
+
+  start_rpc_server: True
+  rpc_port: 14557
 
   ssl:
-    private_crt:  "config/ssl/timelord/private_timelord.crt"
-    private_key:  "config/ssl/timelord/private_timelord.key"
-    public_crt:  "config/ssl/timelord/public_timelord.crt"
-    public_key:  "config/ssl/timelord/public_timelord.key"
+    private_crt: "config/ssl/timelord/private_timelord.crt"
+    private_key: "config/ssl/timelord/private_timelord.key"
+    public_crt: "config/ssl/timelord/public_timelord.crt"
+    public_key: "config/ssl/timelord/public_timelord.key"
 
 full_node:
   # The full node server (if run) will run on this port
   port: 14444
+  # The full node will attempt to connect to these full nodes
+  full_node_peers: []
 
   # controls the sync-to-disk behavior of the database connection. Can be one of:
   # "on"    enables syncing to disk, minimizes risk of corrupting the DB in
@@ -229,13 +310,28 @@ full_node:
   #         kernel panics
   # "auto"  on/off is decided based on a heuristic of how likely a failure is on
   #         the particular system we're running on. Defaults to "full".
-  db_sync: auto
+  db_sync: "auto"
+
+  # the number of threads used to read from the blockchain database
+  # concurrently. There's always only 1 writer, but the number of readers is
+  # configurable
+  db_readers: 4
 
   # Run multiple nodes with different databases by changing the database_path
-  database_path: db/blockchain_v1_CHALLENGE.sqlite
+  database_path: db/blockchain_v2_CHALLENGE.sqlite
+  # peer_db_path is deprecated and has been replaced by peers_file_path
   peer_db_path: db/peer_table_node.sqlite
-  simulator_database_path: sim_db/simulator_blockchain_v1_CHALLENGE.sqlite
-  simulator_peer_db_path: sim_db/peer_table_node.sqlite
+  peers_file_path: db/peers.dat
+
+  multiprocessing_start_method: default
+
+  # The maximum number of UnfinishedBlocks we accept (and forward) with the
+  # same reward hash (but different foliage hashes). Traditionally this was
+  # effectively 1, meaning whichever UnfinishedBlock we saw first was the only
+  # one we forwarded. In 2.2.0 we relaxed the protocol to allow some
+  # duplicates be forwarded, in order to allow the timelords to,
+  # deterministically, pick which one to infuse
+  max_duplicate_unfinished_blocks: 3
 
   # If True, starts an RPC server at the following port
   start_rpc_server: True
@@ -250,12 +346,23 @@ full_node:
   # If node is more than these blocks behind, will do a short batch-sync, if it's less, will do a backtrack sync
   short_sync_blocks_behind_threshold: 20
 
+  bad_peak_cache_size: 100
+
+  # When creating process pools the process count will generally be the CPU count minus
+  # this reserved core count.
+  reserved_cores: 0
+
+  # set this to true to not offload heavy lifting into separate child processes.
+  # this option is mostly useful when profiling, since only the main process is
+  # profiled.
+  single_threaded: False
+
   # How often to initiate outbound connections to other full nodes.
   peer_connect_interval: 30
   # How long to wait for a peer connection
   peer_connect_timeout: 30
   # Accept peers until this number of connections
-  target_peer_count: 80
+  target_peer_count: 40
   # Initiate outbound connections until this number is hit.
   target_outbound_peer_count: 8
   # IPv4/IPv6 network addresses and CIDR blocks allowed to connect even when target_peer_count has been hit.
@@ -268,7 +375,7 @@ full_node:
   # Only connect to peers who we have heard about in the last recent_peer_threshold seconds
   recent_peer_threshold: 6000
 
-  # Send to a Bluebox (sanatizing timelord) uncompact blocks once every
+  # Send to a Bluebox (sanitizing timelord) uncompact blocks once every
   # 'send_uncompact_interval' seconds. Set to 0 if you don't use this feature.
   send_uncompact_interval: 0
   # At every 'send_uncompact_interval' seconds, send blueboxes 'target_uncompact_proofs' proofs to be normalized.
@@ -277,46 +384,66 @@ full_node:
   # Default is set to False, as the network needs only one or two blueboxes like this.
   sanitize_weight_proof_only: False
   # timeout for weight proof request
-  weight_proof_timeout: 360
+  weight_proof_timeout: &weight_proof_timeout 360
 
-  # when enabled, the full node will print a pstats profile to the root_dir/profile every second
-  # analyze with chia/utils/profiler.py
+  # when the full node enters sync-mode, we wait until we have collected peaks
+  # from at least 3 peers, or until we've waitied this many seconds
+  max_sync_wait: 30
+
+  # when enabled, the full node will print a pstats profile to the
+  # root_dir/profile-node directory every second.
+  # analyze with python -m chia.util.profiler <path>
   enable_profiler: False
+
+  # when enabled, each time a block is validated, the python profiler is
+  # engaged. If the validation takes more than 2 seconds, the profile is saved
+  # to disk, in the gold root/block-validation-profile
+  profile_block_validation: False
+
+  enable_memory_profiler: False
 
   # this is a debug and profiling facility that logs all SQLite commands to a
   # separate log file (under logging/sql.log).
   log_sqlite_cmds: False
 
+  # Number of coin_ids | puzzle hashes that node will let wallets subscribe to
+  max_subscribe_items: 200000
+
+  # the maximum number of CoinStates will be returned by a RegisterForPhUpdates
+  # request, for untrusted peers
+  max_subscribe_response_items: 100000
+
+  # Number of coin_ids | puzzle hashes that node will let local wallets subscribe to
+  trusted_max_subscribe_items: 2000000
+
+  # the maximum number of CoinStates will be returned by a RegisterForPhUpdates
+  # request, for trusted peers
+  trusted_max_subscribe_response_items: 500000
+
   # List of trusted DNS seeders to bootstrap from.
   # If you modify this, please change the hardcode as well from FullNode.set_server()
-  dns_servers:
-    - dns-introducer.gold.cab
-  farmer_peer:
-      host: *self_hostname
-      port: 14447
-  timelord_peer:
-      host: *self_hostname
-      port: 14446
+  dns_servers: &dns_servers
+    - "dns-introducer.glcoin.net"
   introducer_peer:
-      host: introducer.gold.cab
-      port: 14445
-  wallet_peer:
-    host: *self_hostname
-    port: 14449
+    host: introducer.glcoin.net # Gold AWS introducer IPv4/IPv6
+    port: 14444
+    enable_private_networks: False
   logging: *logging
   network_overrides: *network_overrides
   selected_network: *selected_network
 
+  # Node IDs of trusted wallet peers, allows using more permissive limits on sync
+  trusted_peers:
+    0ThisisanexampleNodeID7ff9d60f1c3fa270c213c0ad0cb89c01274634a7c3cb7: Does_not_matter
+
   ssl:
-    private_crt:  "config/ssl/full_node/private_full_node.crt"
-    private_key:  "config/ssl/full_node/private_full_node.key"
-    public_crt:  "config/ssl/full_node/public_full_node.crt"
-    public_key:  "config/ssl/full_node/public_full_node.key"
+    private_crt: "config/ssl/full_node/private_full_node.crt"
+    private_key: "config/ssl/full_node/private_full_node.key"
+    public_crt: "config/ssl/full_node/public_full_node.crt"
+    public_key: "config/ssl/full_node/public_full_node.key"
+  use_gold_loop_policy: True
 
 ui:
-   # The ui node server (if run) will run on this port
-  port: 14444
-
   # Which port to use to communicate with the full node
   rpc_port: 14555
 
@@ -338,7 +465,7 @@ introducer:
   host: *self_hostname
   port: 14445
   max_peers_to_send: 20
-  # The introducer will only return peers who it has seen in the last
+  # The introducer will only return peers it has seen in the last
   # recent_peer_threshold seconds
   recent_peer_threshold: 6000
   logging: *logging
@@ -346,55 +473,193 @@ introducer:
   selected_network: *selected_network
 
   ssl:
-    public_crt:  "config/ssl/full_node/public_full_node.crt"
-    public_key:  "config/ssl/full_node/public_full_node.key"
+    public_crt: "config/ssl/full_node/public_full_node.crt"
+    public_key: "config/ssl/full_node/public_full_node.key"
 
 wallet:
-  port: 14449
   rpc_port: 14256
 
+  # when enabled, the wallet will print a pstats profile to the
+  # root_dir/profile-wallet directory every second.
+  # analyze with python -m chia.util.profiler <path>
   enable_profiler: False
 
-  # The minimum height that we care about for our transactions. Set to zero
-  # If we are restoring from private key and don't know the height.
-  starting_height: 0
-  start_height_buffer: 100  # Wallet will stop fly sync at starting_height - buffer
-  num_sync_batches: 50
-  initial_num_public_keys: 100
-  initial_num_public_keys_new_wallet: 5
-
-  full_node_peer:
-    host: *self_hostname
-    port: 14444
+  enable_memory_profiler: False
 
   # see description for full_node.db_sync
   db_sync: auto
 
+  # the number of threads used to read from the wallet database
+  # concurrently. There's always only 1 writer, but the number of readers is
+  # configurable
+  db_readers: 2
+
+  connect_to_unknown_peers: True
+
+  initial_num_public_keys: 425
+  reuse_public_key_for_change:
+    #Add your wallet fingerprint here, this is an example.
+    "2999502625": False
+
+  dns_servers: *dns_servers
+
+  full_node_peers:
+    - host: *self_hostname
+      port: 14444
+  # The path of NFT off-chain metadata cache
+  nft_metadata_cache_path: "nft_cache"
+  # The length of NFT ID prefix will be used as hash index
+  nft_metadata_cache_hash_length: 3
+  multiprocessing_start_method: default
+
   testing: False
-  database_path: wallet/db/blockchain_wallet_v1_CHALLENGE_KEY.sqlite
+  # v2 used by the light wallet sync protocol
+  database_path: wallet/db/blockchain_wallet_v2_CHALLENGE_KEY.sqlite
+  # wallet_peers_path is deprecated and has been replaced by wallet_peers_file_path
   wallet_peers_path: wallet/db/wallet_peers.sqlite
+  wallet_peers_file_path: wallet/db/wallet_peers.dat
+
+  # this is a debug and profiling facility that logs all SQLite commands to a
+  # separate log file (under logging/wallet_sql.log).
+  log_sqlite_cmds: False
 
   logging: *logging
   network_overrides: *network_overrides
   selected_network: *selected_network
 
-  target_peer_count: 5
+  target_peer_count: 3
   peer_connect_interval: 60
   # The introducer will only return peers who it has seen in the last
   # recent_peer_threshold seconds
   recent_peer_threshold: 6000
 
   introducer_peer:
-    host: introducer.gold.cab
-    port: 14445
+    host: introducer.glcoin.net # Gold AWS introducer IPv4/IPv6
+    port: 14444
+    enable_private_networks: False
 
   ssl:
-    private_crt:  "config/ssl/wallet/private_wallet.crt"
-    private_key:  "config/ssl/wallet/private_wallet.key"
-    public_crt:  "config/ssl/wallet/public_wallet.crt"
-    public_key:  "config/ssl/wallet/public_wallet.key"
+    private_crt: "config/ssl/wallet/private_wallet.crt"
+    private_key: "config/ssl/wallet/private_wallet.key"
+    public_crt: "config/ssl/wallet/public_wallet.crt"
+    public_key: "config/ssl/wallet/public_wallet.key"
 
+  # Node IDs of trusted full node peers, for performing a fast trusted wallet sync
   trusted_peers:
-    trusted_node_1: "config/ssl/full_node/public_full_node.crt"
+    0ThisisanexampleNodeID7ff9d60f1c3fa270c213c0ad0cb89c01274634a7c3cb9: Does_not_matter
 
   short_sync_blocks_behind_threshold: 20
+
+  # wallet overrides for limits
+  inbound_rate_limit_percent: 100
+  outbound_rate_limit_percent: 60
+
+  # timeout for weight proof request
+  weight_proof_timeout: *weight_proof_timeout
+
+  # if an unknown CAT belonging to us is seen, a wallet will be automatically created
+  # the user accepts the risk/responsibility of verifying the authenticity and origin of unknown CATs
+  automatically_add_unknown_cats: False
+
+  # Interval to resend unconfirmed transactions, even if previously accepted into Mempool
+  tx_resend_timeout_secs: 1800
+
+  # Reset wallet sync data on start for given fingerprint
+  reset_sync_for_fingerprint: null
+
+  # After n received unspent transactions, the spam filter will be enabled, which will filter out received
+  # coins with very small value. Any standard TX under gl_spam_amount is filtered
+  spam_filter_after_n_txs: 200
+  gl_spam_amount: 1000000
+  # Enable notifications from parties on chain
+  enable_notifications: True
+  # The amount someone has to pay you in mojos for you to see their notification
+  required_notification_amount: 10000000
+
+  # Enabling the delta sync can under certain circumstances lead to missing coin states during re-orgs
+  use_delta_sync: False
+
+  #################################
+  #  Inner puzzle decorators      #
+  #################################
+  # Default puzzle decorator settings, this will apply to all asset wallets under the same key
+  # Here is an example
+  # puzzle_decorators:
+  #   2999502625:
+  #     - decorator: "CLAWBACK"
+  #       clawback_timelock: 3600
+  #     - decorator: "DECORATOR_TYPE" #If you want to add more decorators
+  #       parameter1: 0
+
+  auto_claim:
+    enabled: False
+    tx_fee: 0
+    min_amount: 0
+    batch_size: 50
+
+  auto_sign_txs: True
+
+data_layer:
+  # TODO: consider name
+  # TODO: organize consistently with other sections
+  wallet_peer:
+    host: localhost
+    port: 14256
+
+  database_path: "data_layer/db/data_layer_CHALLENGE.sqlite"
+  # The location where the server files will be stored.
+  server_files_location: "data_layer/db/server_files_location_CHALLENGE"
+  # The timeout for the client to download a file from a server
+  client_timeout: 15
+  # If you need use a proxy for download data you can use this setting sample
+  # proxy_url: http://localhost:8888
+
+  # Data for running a data layer server.
+  host_ip: 0.0.0.0
+  host_port: 14575
+  # Data for running a data layer client.
+  manage_data_interval: 60
+  selected_network: *selected_network
+  # If True, starts an RPC server at the following port
+  start_rpc_server: True
+  # TODO: what considerations are there in choosing this?
+  rpc_port: 14562
+  rpc_server_max_request_body_size: 26214400
+
+  # this is a debug and profiling facility that logs all SQLite commands to a
+  # separate log file (under logging/data_sql.log).
+  log_sqlite_cmds: False
+
+  # Speeds up autoinserts. Disable to perform inserts one by one instead of in a batch.
+  enable_batch_autoinsert: True
+
+  logging: *logging
+
+  ssl:
+    private_crt: "config/ssl/data_layer/private_data_layer.crt"
+    private_key: "config/ssl/data_layer/private_data_layer.key"
+    public_crt: "config/ssl/data_layer/public_data_layer.crt"
+    public_key: "config/ssl/data_layer/public_data_layer.key"
+
+  plugins:
+    uploaders: []
+    downloaders: []
+  maximum_full_file_count: 1
+
+simulator:
+  # Should the simulator farm a block whenever a transaction is in mempool
+  auto_farm: True
+
+  # The key used by the simulator to farm blocks and send transactions
+  key_fingerprint:
+
+  # The target address for any blocks that are farmed
+  farming_address:
+
+  # the directory used to save plots
+  # for the plot directory below the final directory will be: ~/.gold/simulator/plots
+  plot_directory: simulator/plots
+
+  # Should we use real time in the simulated chain?
+  # most tests don't need this, however it is pretty important when writing ChiaLisp
+  use_current_time: True

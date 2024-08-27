@@ -1,0 +1,17 @@
+[Unit]
+Description=Gold Data Layer Service for %i
+Requires=gold-daemon@%i.service
+After=gold-daemon@%i.service
+
+[Service]
+Type=simple
+Environment=GOLD_ROOT=/home/%i/.gold/mainnet
+ExecStart=/opt/gold/gold_data_layer
+User=%i
+Group=%i
+LimitNOFILE=1048576
+LimitNPROC=1048576
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

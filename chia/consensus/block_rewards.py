@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 from chia.util.ints import uint32, uint64
 
-# 1 gl coin = 1,000,000,000,000 = 1 trillion mojo.
-_mojo_per_chia = 1000000000000
+# 1 Gold coin = 1,000,000,000,000 = 1 trillion mojo.
+_mojo_per_gold = 1000000000000
 _blocks_per_year = 1681920  # 32 * 6 * 24 * 365
 
 # preserve + testnet supply
@@ -27,18 +29,18 @@ def calculate_pool_reward(height: uint32) -> uint64:
     rates increase continuously.
     """
     if reward_hardfork_activated(height):
-        return 0
+        return uint64(0)
 
     if height == 0:
-        return uint64(int((7 / 8) * PREFARM * _mojo_per_chia))
+        return uint64(int((7 / 8) * PREFARM * _mojo_per_gold))
     elif height < 3 * _blocks_per_year:
-        return uint64(int((7 / 8) * 1 * _mojo_per_chia))
+        return uint64(int((7 / 8) * 1 * _mojo_per_gold))
     elif height < 6 * _blocks_per_year:
-        return uint64(int((7 / 8) * 0.5 * _mojo_per_chia))
+        return uint64(int((7 / 8) * 0.5 * _mojo_per_gold))
     elif height < 9 * _blocks_per_year:
-        return uint64(int((7 / 8) * 0.25 * _mojo_per_chia))
+        return uint64(int((7 / 8) * 0.25 * _mojo_per_gold))
     else:
-        return uint64(int((7 / 8) * 0.125 * _mojo_per_chia))
+        return uint64(int((7 / 8) * 0.125 * _mojo_per_gold))
 
 
 def calculate_base_farmer_reward(height: uint32) -> uint64:
@@ -56,12 +58,12 @@ def calculate_base_farmer_reward(height: uint32) -> uint64:
         coefficient = 1 / 8
 
     if height == 0:
-        return uint64(int(coefficient * PREFARM * _mojo_per_chia))
+        return uint64(int(coefficient * PREFARM * _mojo_per_gold))
     elif height < 3 * _blocks_per_year:
-        return uint64(int(coefficient * 1 * _mojo_per_chia))
+        return uint64(int(coefficient * 1 * _mojo_per_gold))
     elif height < 6 * _blocks_per_year:
-        return uint64(int(coefficient * 0.5 * _mojo_per_chia))
+        return uint64(int(coefficient * 0.5 * _mojo_per_gold))
     elif height < 9 * _blocks_per_year:
-        return uint64(int(coefficient * 0.25 * _mojo_per_chia))
+        return uint64(int(coefficient * 0.25 * _mojo_per_gold))
     else:
-        return uint64(int(coefficient * 0.125 * _mojo_per_chia))
+        return uint64(int(coefficient * 0.125 * _mojo_per_gold))

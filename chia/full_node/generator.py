@@ -1,19 +1,23 @@
+from __future__ import annotations
+
 import logging
-from typing import List, Optional, Union, Tuple
-from chia.types.blockchain_format.program import Program, SerializedProgram
-from chia.types.generator_types import BlockGenerator, GeneratorArg, GeneratorBlockCacheInterface, CompressorArg
-from chia.util.ints import uint32, uint64
-from chia.wallet.puzzles.load_clvm import load_clvm
-from chia.wallet.puzzles.rom_bootstrap_generator import get_generator
+from typing import List, Optional, Union
 
-GENERATOR_MOD = get_generator()
+from chia.types.blockchain_format.program import Program
+from chia.types.blockchain_format.serialized_program import SerializedProgram
+from chia.types.generator_types import BlockGenerator, CompressorArg, GeneratorBlockCacheInterface
+from chia.util.ints import uint32
+from chia.wallet.puzzles.load_clvm import load_clvm_maybe_recompile
 
-DECOMPRESS_BLOCK = load_clvm("block_program_zero.clvm", package_or_requirement="chia.wallet.puzzles")
-DECOMPRESS_PUZZLE = load_clvm("decompress_puzzle.clvm", package_or_requirement="chia.wallet.puzzles")
-# DECOMPRESS_CSE = load_clvm("decompress_coin_spend_entry.clvm", package_or_requirement="chia.wallet.puzzles")
+DECOMPRESS_BLOCK = load_clvm_maybe_recompile("block_program_zero.clsp", package_or_requirement="chia.full_node.puzzles")
+DECOMPRESS_PUZZLE = load_clvm_maybe_recompile("decompress_puzzle.clsp", package_or_requirement="chia.full_node.puzzles")
+# DECOMPRESS_CSE = load_clvm_maybe_recompile(
+#     "decompress_coin_spend_entry.clsp",
+#     package_or_requirement="chia.full_node.puzzles",
+# )
 
-DECOMPRESS_CSE_WITH_PREFIX = load_clvm(
-    "decompress_coin_spend_entry_with_prefix.clvm", package_or_requirement="chia.wallet.puzzles"
+DECOMPRESS_CSE_WITH_PREFIX = load_clvm_maybe_recompile(
+    "decompress_coin_spend_entry_with_prefix.clsp", package_or_requirement="chia.full_node.puzzles"
 )
 log = logging.getLogger(__name__)
 
@@ -22,27 +26,21 @@ def create_block_generator(
     generator: SerializedProgram, block_heights_list: List[uint32], generator_block_cache: GeneratorBlockCacheInterface
 ) -> Optional[BlockGenerator]:
     """`create_block_generator` will returns None if it fails to look up any referenced block"""
-    generator_arg_list: List[GeneratorArg] = []
+    generator_list: List[SerializedProgram] = []
+    generator_heights: List[uint32] = []
     for i in block_heights_list:
         previous_generator = generator_block_cache.get_generator_for_block_height(i)
         if previous_generator is None:
             log.error(f"Failed to look up generator for block {i}. Ref List: {block_heights_list}")
             return None
-        generator_arg_list.append(GeneratorArg(i, previous_generator))
-    return BlockGenerator(generator, generator_arg_list)
-
-
-def create_generator_args(generator_ref_list: List[SerializedProgram]) -> Program:
-    """
-    `create_generator_args`: The format and contents of these arguments affect consensus.
-    """
-    gen_ref_list = [bytes(g) for g in generator_ref_list]
-    return Program.to([gen_ref_list])
+        generator_list.append(previous_generator)
+        generator_heights.append(i)
+    return BlockGenerator(generator, generator_list, generator_heights)
 
 
 def create_compressed_generator(
     original_generator: CompressorArg,
-    compressed_cse_list: List[List[Union[List[uint64], List[Union[bytes, None, Program]]]]],
+    compressed_cse_list: List[List[List[Union[bytes, None, int, Program]]]],
 ) -> BlockGenerator:
     """
     Bind the generator block program template to a particular reference block,
@@ -53,21 +51,6 @@ def create_compressed_generator(
     program = DECOMPRESS_BLOCK.curry(
         DECOMPRESS_PUZZLE, DECOMPRESS_CSE_WITH_PREFIX, Program.to(start), Program.to(end), compressed_cse_list
     )
-    generator_arg = GeneratorArg(original_generator.block_height, original_generator.generator)
-    return BlockGenerator(program, [generator_arg])
-
-
-def setup_generator_args(self: BlockGenerator) -> Tuple[SerializedProgram, Program]:
-    args = create_generator_args(self.generator_refs())
-    return self.program, args
-
-
-def run_generator(self: BlockGenerator, max_cost: int) -> Tuple[int, SerializedProgram]:
-    program, args = setup_generator_args(self)
-    return GENERATOR_MOD.run_safe_with_cost(max_cost, program, args)
-
-
-def run_generator_unsafe(self: BlockGenerator, max_cost: int) -> Tuple[int, SerializedProgram]:
-    """This mode is meant for accepting possibly soft-forked transactions into the mempool"""
-    program, args = setup_generator_args(self)
-    return GENERATOR_MOD.run_with_cost(max_cost, program, args)
+    return BlockGenerator(
+        SerializedProgram.from_program(program), [original_generator.generator], [original_generator.block_height]
+    )

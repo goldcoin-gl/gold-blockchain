@@ -1,51 +1,104 @@
+from __future__ import annotations
+
+import dataclasses
 import logging
 import time
-import traceback
-from pathlib import Path
-from secrets import token_bytes
-from typing import Any, Dict, List, Optional, Tuple
+from collections import deque
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple, Union, cast
 
-from blspy import AugSchemeMPL
+from typing_extensions import Literal, Never
 
-from chia.types.blockchain_format.coin import Coin
+from chia.data_layer.data_layer_wallet import DataLayerWallet
+from chia.protocols.wallet_protocol import CoinState
+from chia.server.ws_connection import WSGoldConnection
+from chia.types.blockchain_format.coin import Coin, coin_as_list
 from chia.types.blockchain_format.program import Program
 from chia.types.blockchain_format.sized_bytes import bytes32
-from chia.types.spend_bundle import SpendBundle
-from chia.types.coin_spend import CoinSpend
-from chia.util.byte_types import hexstr_to_bytes
-from chia.util.db_wrapper import DBWrapper
+from chia.types.spend_bundle import SpendBundle, estimate_fees
+from chia.util.db_wrapper import DBWrapper2
 from chia.util.hash import std_hash
 from chia.util.ints import uint32, uint64
-from chia.wallet.cc_wallet import cc_utils
-from chia.wallet.cc_wallet.cc_utils import CC_MOD, SpendableCC, spend_bundle_for_spendable_ccs, uncurry_cc
-from chia.wallet.cc_wallet.cc_wallet import CCWallet
-from chia.wallet.puzzles.genesis_by_coin_id_with_0 import genesis_coin_id_for_genesis_coin_checker
+from chia.wallet.conditions import (
+    AssertCoinAnnouncement,
+    Condition,
+    ConditionValidTimes,
+    CreateCoinAnnouncement,
+    parse_conditions_non_consensus,
+    parse_timelock_info,
+)
+from chia.wallet.db_wallet.db_wallet_puzzles import ACS_MU_PH
+from chia.wallet.nft_wallet.nft_wallet import NFTWallet
+from chia.wallet.outer_puzzles import AssetType
+from chia.wallet.payment import Payment
+from chia.wallet.puzzle_drivers import PuzzleInfo, Solver
+from chia.wallet.puzzles.load_clvm import load_clvm_maybe_recompile
 from chia.wallet.trade_record import TradeRecord
+from chia.wallet.trading.offer import NotarizedPayment, Offer
 from chia.wallet.trading.trade_status import TradeStatus
 from chia.wallet.trading.trade_store import TradeStore
 from chia.wallet.transaction_record import TransactionRecord
-from chia.wallet.util.trade_utils import (
-    get_discrepancies_for_spend_bundle,
-    get_output_amount_for_puzzle_and_solution,
-    get_output_discrepancy_for_puzzle_and_solution,
-)
+from chia.wallet.uncurried_puzzle import uncurry_puzzle
+from chia.wallet.util.compute_hints import compute_spend_hints_and_additions
+from chia.wallet.util.query_filter import HashFilter
 from chia.wallet.util.transaction_type import TransactionType
+from chia.wallet.util.tx_config import TXConfig
 from chia.wallet.util.wallet_types import WalletType
+from chia.wallet.vc_wallet.cr_cat_drivers import ProofsChecker, construct_pending_approval_state
+from chia.wallet.vc_wallet.vc_wallet import VCWallet
 from chia.wallet.wallet import Wallet
 from chia.wallet.wallet_coin_record import WalletCoinRecord
 
+OFFER_MOD = load_clvm_maybe_recompile("settlement_payments.clsp")
+
 
 class TradeManager:
+    """
+    This class is a driver for creating and accepting settlement_payments.clsp style offers.
+
+    By default, standard GL is supported but to support other types of assets you must implement certain functions on
+    the asset's wallet as well as create a driver for its puzzle(s).  Here is a guide to integrating a new types of
+    assets with this trade manager:
+
+    Puzzle Drivers:
+      - See chia/wallet/outer_puzzles.py for a full description of how to build these
+      - The `solve` method must be able to be solved by a Solver that looks like this:
+            Solver(
+                {
+                    "coin": bytes
+                    "parent_spend": bytes
+                    "siblings": List[bytes]  # other coins of the same type being offered
+                    "sibling_spends": List[bytes]  # The parent spends for the siblings
+                    "sibling_puzzles": List[Program]  # The inner puzzles of the siblings (always OFFER_MOD)
+                    "sibling_solutions": List[Program]  # The inner solution of the siblings
+            }
+            )
+
+    Wallet:
+      - Segments in this code that call general wallet methods are highlighted by comments: # ATTENTION: new wallets
+      - To be able to be traded, a wallet must implement these methods on itself:
+        - generate_signed_transaction(...) -> List[TransactionRecord]  (See cat_wallet.py for full API)
+        - convert_puzzle_hash(puzzle_hash: bytes32) -> bytes32  # Converts a puzzlehash from outer to inner puzzle
+        - get_puzzle_info(asset_id: bytes32) -> PuzzleInfo
+        - get_coins_to_offer(asset_id: bytes32, amount: uint64) -> Set[Coin]
+      - If you would like assets from your wallet to be referenced with just a wallet ID, you must also implement:
+        - get_asset_id() -> bytes32
+      - Finally, you must make sure that your wallet will respond appropriately when these WSM methods are called:
+        - get_wallet_for_puzzle_info(puzzle_info: PuzzleInfo) -> <Your wallet>
+        - create_wallet_for_puzzle_info(..., puzzle_info: PuzzleInfo) -> <Your wallet>  (See cat_wallet.py for full API)
+        - get_wallet_for_asset_id(asset_id: bytes32) -> <Your wallet>
+    """
+
     wallet_state_manager: Any
     log: logging.Logger
     trade_store: TradeStore
+    most_recently_deserialized_trade: Optional[Tuple[bytes32, Offer]]
 
     @staticmethod
     async def create(
         wallet_state_manager: Any,
-        db_wrapper: DBWrapper,
-        name: str = None,
-    ):
+        db_wrapper: DBWrapper2,
+        name: Optional[str] = None,
+    ) -> TradeManager:
         self = TradeManager()
         if name:
             self.log = logging.getLogger(name)
@@ -54,6 +107,7 @@ class TradeManager:
 
         self.wallet_state_manager = wallet_state_manager
         self.trade_store = await TradeStore.create(db_wrapper)
+        self.most_recently_deserialized_trade = None
         return self
 
     async def get_offers_with_status(self, status: TradeStatus) -> List[TradeRecord]:
@@ -62,95 +116,92 @@ class TradeManager:
 
     async def get_coins_of_interest(
         self,
-    ) -> Tuple[Dict[bytes32, Coin], Dict[bytes32, Coin]]:
+    ) -> Set[bytes32]:
         """
         Returns list of coins we want to check if they are included in filter,
         These will include coins that belong to us and coins that that on other side of treade
         """
-        all_pending = []
-        pending_accept = await self.get_offers_with_status(TradeStatus.PENDING_ACCEPT)
-        pending_confirm = await self.get_offers_with_status(TradeStatus.PENDING_CONFIRM)
-        pending_cancel = await self.get_offers_with_status(TradeStatus.PENDING_CANCEL)
-        all_pending.extend(pending_accept)
-        all_pending.extend(pending_confirm)
-        all_pending.extend(pending_cancel)
-        removals = {}
-        additions = {}
-
-        for trade in all_pending:
-            for coin in trade.removals:
-                removals[coin.name()] = coin
-            for coin in trade.additions:
-                additions[coin.name()] = coin
-
-        return removals, additions
+        coin_ids = await self.trade_store.get_coin_ids_of_interest_with_trade_statuses(
+            trade_statuses=[TradeStatus.PENDING_ACCEPT, TradeStatus.PENDING_CONFIRM, TradeStatus.PENDING_CANCEL]
+        )
+        return coin_ids
 
     async def get_trade_by_coin(self, coin: Coin) -> Optional[TradeRecord]:
         all_trades = await self.get_all_trades()
         for trade in all_trades:
-            if trade.status == TradeStatus.CANCELED.value:
+            if trade.status == TradeStatus.CANCELLED.value:
                 continue
-            if coin in trade.removals:
-                return trade
-            if coin in trade.additions:
+            if coin in trade.coins_of_interest:
                 return trade
         return None
 
-    async def coins_of_interest_farmed(self, removals: List[Coin], additions: List[Coin], height: uint32):
+    async def coins_of_interest_farmed(
+        self, coin_state: CoinState, fork_height: Optional[uint32], peer: WSGoldConnection
+    ) -> None:
         """
         If both our coins and other coins in trade got removed that means that trade was successfully executed
         If coins from other side of trade got farmed without ours, that means that trade failed because either someone
         else completed trade or other side of trade canceled the trade by doing a spend.
         If our coins got farmed but coins from other side didn't, we successfully canceled trade by spending inputs.
         """
-        removal_dict = {}
-        addition_dict = {}
-        checked: Dict[bytes32, Coin] = {}
-        for coin in removals:
-            removal_dict[coin.name()] = coin
-        for coin in additions:
-            addition_dict[coin.name()] = coin
+        self.log.info(f"coins_of_interest_farmed: {coin_state}")
+        trade = await self.get_trade_by_coin(coin_state.coin)
+        if trade is None:
+            self.log.error(f"Coin: {coin_state.coin}, not in any trade")
+            return
+        if coin_state.spent_height is None:
+            self.log.error(f"Coin: {coin_state.coin}, has not been spent so trade can remain valid")
+        # Then let's filter the offer into coins that WE offered
+        if (
+            self.most_recently_deserialized_trade is not None
+            and trade.trade_id == self.most_recently_deserialized_trade[0]
+        ):
+            offer = self.most_recently_deserialized_trade[1]
+        else:
+            offer = Offer.from_bytes(trade.offer)
+            self.most_recently_deserialized_trade = (trade.trade_id, offer)
+        primary_coin_ids = [c.name() for c in offer.removals()]
+        # TODO: Add `WalletCoinStore.get_coins`.
+        result = await self.wallet_state_manager.coin_store.get_coin_records(
+            coin_id_filter=HashFilter.include(primary_coin_ids)
+        )
+        our_primary_coins: List[Coin] = [cr.coin for cr in result.records]
+        our_additions: List[Coin] = list(
+            filter(lambda c: offer.get_root_removal(c) in our_primary_coins, offer.additions())
+        )
+        our_addition_ids: List[bytes32] = [c.name() for c in our_additions]
 
-        all_coins = []
-        all_coins.extend(removals)
-        all_coins.extend(additions)
+        # And get all relevant coin states
+        coin_states = await self.wallet_state_manager.wallet_node.get_coin_state(
+            our_addition_ids,
+            peer=peer,
+            fork_height=fork_height,
+        )
+        assert coin_states is not None
+        coin_state_names: List[bytes32] = [cs.coin.name() for cs in coin_states]
+        # If any of our settlement_payments were spent, this offer was a success!
+        if set(our_addition_ids) == set(coin_state_names):
+            height = coin_states[0].created_height
+            await self.trade_store.set_status(trade.trade_id, TradeStatus.CONFIRMED, index=height)
+            tx_records: List[TransactionRecord] = await self.calculate_tx_records_for_offer(offer, False)
+            for tx in tx_records:
+                if TradeStatus(trade.status) == TradeStatus.PENDING_ACCEPT:
+                    await self.wallet_state_manager.add_transaction(
+                        dataclasses.replace(tx, confirmed_at_height=height, confirmed=True)
+                    )
 
-        for coin in all_coins:
-            if coin.name() in checked:
-                continue
-            trade = await self.get_trade_by_coin(coin)
-            if trade is None:
-                self.log.error(f"Coin: {Coin}, not in any trade")
-                continue
+            self.log.info(f"Trade with id: {trade.trade_id} confirmed at height: {height}")
+        else:
+            # In any other scenario this trade failed
+            await self.wallet_state_manager.delete_trade_transactions(trade.trade_id)
+            if trade.status == TradeStatus.PENDING_CANCEL.value:
+                await self.trade_store.set_status(trade.trade_id, TradeStatus.CANCELLED)
+                self.log.info(f"Trade with id: {trade.trade_id} canceled")
+            elif trade.status == TradeStatus.PENDING_CONFIRM.value:
+                await self.trade_store.set_status(trade.trade_id, TradeStatus.FAILED)
+                self.log.warning(f"Trade with id: {trade.trade_id} failed")
 
-            # Check if all coins that are part of the trade got farmed
-            # If coin is missing, trade failed
-            failed = False
-            for removed_coin in trade.removals:
-                if removed_coin.name() not in removal_dict:
-                    self.log.error(f"{removed_coin} from trade not removed")
-                    failed = True
-                checked[removed_coin.name()] = removed_coin
-            for added_coin in trade.additions:
-                if added_coin.name() not in addition_dict:
-                    self.log.error(f"{added_coin} from trade not added")
-                    failed = True
-                checked[coin.name()] = coin
-
-            if failed is False:
-                # Mark this trade as successful
-                await self.trade_store.set_status(trade.trade_id, TradeStatus.CONFIRMED, True, height)
-                self.log.info(f"Trade with id: {trade.trade_id} confirmed at height: {height}")
-            else:
-                # Either we canceled this trade or this trade failed
-                if trade.status == TradeStatus.PENDING_CANCEL.value:
-                    await self.trade_store.set_status(trade.trade_id, TradeStatus.CANCELED, True)
-                    self.log.info(f"Trade with id: {trade.trade_id} canceled at height: {height}")
-                elif trade.status == TradeStatus.PENDING_CONFIRM.value:
-                    await self.trade_store.set_status(trade.trade_id, TradeStatus.FAILED, True)
-                    self.log.warning(f"Trade with id: {trade.trade_id} failed at height: {height}")
-
-    async def get_locked_coins(self, wallet_id: int = None) -> Dict[bytes32, WalletCoinRecord]:
+    async def get_locked_coins(self) -> Dict[bytes32, WalletCoinRecord]:
         """Returns a dictionary of confirmed coins that are locked by a trade."""
         all_pending = []
         pending_accept = await self.get_offers_with_status(TradeStatus.PENDING_ACCEPT)
@@ -159,493 +210,840 @@ class TradeManager:
         all_pending.extend(pending_accept)
         all_pending.extend(pending_confirm)
         all_pending.extend(pending_cancel)
-        if len(all_pending) == 0:
-            return {}
 
-        result = {}
+        coins_of_interest = []
         for trade_offer in all_pending:
-            if trade_offer.tx_spend_bundle is None:
-                locked = await self.get_locked_coins_in_spend_bundle(trade_offer.spend_bundle)
-            else:
-                locked = await self.get_locked_coins_in_spend_bundle(trade_offer.tx_spend_bundle)
-            for name, record in locked.items():
-                if wallet_id is None or record.wallet_id == wallet_id:
-                    result[name] = record
+            coins_of_interest.extend([c.name() for c in trade_offer.coins_of_interest])
 
-        return result
+        # TODO:
+        #  - No need to get the coin records here, we are only interested in the coin_id on the call site.
+        #  - The cast here is required for now because TradeManager.wallet_state_manager is hinted as Any.
+        return cast(
+            Dict[bytes32, WalletCoinRecord],
+            (
+                await self.wallet_state_manager.coin_store.get_coin_records(
+                    coin_id_filter=HashFilter.include(coins_of_interest)
+                )
+            ).coin_id_to_record,
+        )
 
-    async def get_all_trades(self):
+    async def get_all_trades(self) -> List[TradeRecord]:
         all: List[TradeRecord] = await self.trade_store.get_all_trades()
         return all
 
-    async def get_trade_by_id(self, trade_id: bytes) -> Optional[TradeRecord]:
+    async def get_trade_by_id(self, trade_id: bytes32) -> Optional[TradeRecord]:
         record = await self.trade_store.get_trade_record(trade_id)
         return record
 
-    async def get_locked_coins_in_spend_bundle(self, bundle: SpendBundle) -> Dict[bytes32, WalletCoinRecord]:
-        """Returns a list of coin records that are used in this SpendBundle"""
-        result = {}
-        removals = bundle.removals()
-        for coin in removals:
-            coin_record = await self.wallet_state_manager.coin_store.get_coin_record(coin.name())
-            if coin_record is None:
-                continue
-            result[coin_record.name()] = coin_record
-        return result
+    async def fail_pending_offer(self, trade_id: bytes32) -> None:
+        await self.trade_store.set_status(trade_id, TradeStatus.FAILED)
+        self.wallet_state_manager.state_changed("offer_failed")
 
-    async def cancel_pending_offer(self, trade_id: bytes32):
-        await self.trade_store.set_status(trade_id, TradeStatus.CANCELED, False)
-
-    async def cancel_pending_offer_safely(self, trade_id: bytes32):
+    async def cancel_pending_offers(
+        self,
+        trades: List[bytes32],
+        tx_config: TXConfig,
+        fee: uint64 = uint64(0),
+        secure: bool = True,  # Cancel with a transaction on chain
+        trade_cache: Dict[bytes32, TradeRecord] = {},  # Optional pre-fetched trade records for optimization
+        extra_conditions: Tuple[Condition, ...] = tuple(),
+    ) -> List[TransactionRecord]:
         """This will create a transaction that includes coins that were offered"""
-        self.log.info(f"Secure-Cancel pending offer with id trade_id {trade_id.hex()}")
-        trade = await self.trade_store.get_trade_record(trade_id)
-        if trade is None:
-            return None
 
-        all_coins = trade.removals
-
-        for coin in all_coins:
-            wallet = await self.wallet_state_manager.get_wallet_for_coin(coin.name())
-
-            if wallet is None:
-                continue
-            new_ph = await wallet.get_new_puzzlehash()
-            if wallet.type() == WalletType.COLOURED_COIN.value:
-                tx = await wallet.generate_signed_transaction(
-                    [coin.amount], [new_ph], 0, coins={coin}, ignore_max_send_amount=True
-                )
+        # Need to do some pre-figuring of announcements that will be need to be made
+        announcement_nonce: bytes32 = std_hash(b"".join(trades))
+        trade_records: List[TradeRecord] = []
+        all_cancellation_coins: List[List[Coin]] = []
+        announcement_creations: Deque[CreateCoinAnnouncement] = deque()
+        announcement_assertions: Deque[AssertCoinAnnouncement] = deque()
+        for trade_id in trades:
+            if trade_id in trade_cache:
+                trade = trade_cache[trade_id]
             else:
-                tx = await wallet.generate_signed_transaction(
-                    coin.amount, new_ph, 0, coins={coin}, ignore_max_send_amount=True
+                potential_trade = await self.trade_store.get_trade_record(trade_id)
+                if potential_trade is None:
+                    self.log.error(f"Cannot find offer {trade_id.hex()}, skip cancellation.")
+                    continue
+                else:
+                    trade = potential_trade
+
+            cancellation_coins = Offer.from_bytes(trade.offer).get_cancellation_coins()
+            for coin in cancellation_coins:
+                creation = CreateCoinAnnouncement(msg=announcement_nonce, coin_id=coin.name())
+                announcement_creations.append(creation)
+                announcement_assertions.append(creation.corresponding_assertion())
+
+            trade_records.append(trade)
+            all_cancellation_coins.append(cancellation_coins)
+
+        # Make every coin assert the announcement from the one before them
+        announcement_assertions.rotate(1)
+
+        all_txs: List[TransactionRecord] = []
+        bundles: List[SpendBundle] = []
+        fee_to_pay: uint64 = fee
+        for trade, cancellation_coins in zip(trade_records, all_cancellation_coins):
+            self.log.info(f"Secure-Cancel pending offer with id trade_id {trade.trade_id.hex()}")
+
+            if not secure:
+                self.wallet_state_manager.state_changed("offer_cancelled")
+                await self.trade_store.set_status(trade.trade_id, TradeStatus.CANCELLED)
+                continue
+
+            cancellation_additions: List[Coin] = []
+            valid_times: ConditionValidTimes = parse_timelock_info(extra_conditions)
+            for coin in cancellation_coins:
+                wallet = await self.wallet_state_manager.get_wallet_for_coin(coin.name())
+
+                if wallet is None:
+                    self.log.error(f"Cannot find wallet for offer {trade.trade_id}, skip cancellation.")
+                    continue
+
+                new_ph = await wallet.wallet_state_manager.main_wallet.get_new_puzzlehash()
+
+                if len(trade_records) > 1 or len(cancellation_coins) > 1:
+                    announcement_conditions: Tuple[Condition, ...] = (
+                        announcement_creations.popleft(),
+                        announcement_assertions.popleft(),
+                    )
+                else:
+                    announcement_conditions = tuple()
+                # This should probably not switch on whether or not we're spending a GL but it has to for now
+                if wallet.type() == WalletType.STANDARD_WALLET:
+                    if fee_to_pay > coin.amount:
+                        selected_coins: Set[Coin] = await wallet.select_coins(
+                            uint64(fee_to_pay - coin.amount),
+                            tx_config.coin_selection_config.override(
+                                excluded_coin_ids=[*tx_config.coin_selection_config.excluded_coin_ids, coin.name()],
+                            ),
+                        )
+                        selected_coins.add(coin)
+                    else:
+                        selected_coins = {coin}
+                    [tx] = await wallet.generate_signed_transaction(
+                        uint64(sum([c.amount for c in selected_coins]) - fee_to_pay),
+                        new_ph,
+                        tx_config.override(
+                            excluded_coin_ids=[],
+                        ),
+                        origin_id=coin.name(),
+                        fee=fee_to_pay,
+                        coins=selected_coins,
+                        extra_conditions=(*extra_conditions, *announcement_conditions),
+                    )
+                    if tx is not None and tx.spend_bundle is not None:
+                        bundles.append(tx.spend_bundle)
+                        cancellation_additions.extend(tx.spend_bundle.additions())
+                        all_txs.append(dataclasses.replace(tx, spend_bundle=None))
+                else:
+                    # ATTENTION: new_wallets
+                    txs = await wallet.generate_signed_transaction(
+                        [coin.amount],
+                        [new_ph],
+                        tx_config.override(
+                            excluded_coin_ids=[],
+                        ),
+                        fee=fee_to_pay,
+                        coins={coin},
+                        extra_conditions=(*extra_conditions, *announcement_conditions),
+                    )
+                    for tx in txs:
+                        if tx is not None and tx.spend_bundle is not None:
+                            bundles.append(tx.spend_bundle)
+                            cancellation_additions.extend(tx.spend_bundle.additions())
+                            all_txs.append(dataclasses.replace(tx, spend_bundle=None))
+                fee_to_pay = uint64(0)
+                extra_conditions = tuple()
+
+                all_txs.append(
+                    TransactionRecord(
+                        confirmed_at_height=uint32(0),
+                        created_at_time=uint64(int(time.time())),
+                        to_puzzle_hash=new_ph,
+                        amount=uint64(coin.amount),
+                        fee_amount=fee,
+                        confirmed=False,
+                        sent=uint32(10),
+                        spend_bundle=None,
+                        additions=cancellation_additions,
+                        removals=[coin],
+                        wallet_id=wallet.id(),
+                        sent_to=[],
+                        trade_id=None,
+                        type=uint32(TransactionType.INCOMING_TX.value),
+                        name=cancellation_additions[0].name(),
+                        memos=[],
+                        valid_times=valid_times,
+                    )
                 )
-            await self.wallet_state_manager.add_pending_transaction(tx_record=tx)
 
-        await self.trade_store.set_status(trade_id, TradeStatus.PENDING_CANCEL, False)
-        return None
+            await self.trade_store.set_status(trade.trade_id, TradeStatus.PENDING_CANCEL)
+        # Aggregate spend bundles to the first tx
+        if len(all_txs) > 0:
+            all_txs[0] = dataclasses.replace(all_txs[0], spend_bundle=SpendBundle.aggregate(bundles))
 
-    async def save_trade(self, trade: TradeRecord):
-        await self.trade_store.add_trade_record(trade, False)
+        all_txs = [dataclasses.replace(tx, fee_amount=fee) for tx in all_txs]
+
+        return all_txs
+
+    async def save_trade(self, trade: TradeRecord, offer: Offer) -> None:
+        offer_name: bytes32 = offer.name()
+        await self.trade_store.add_trade_record(trade, offer_name)
+
+        # We want to subscribe to the coin IDs of all coins that are not the ephemeral offer coins
+        offered_coins: Set[Coin] = {value for values in offer.get_offered_coins().values() for value in values}
+        non_offer_additions: Set[Coin] = set(offer.additions()) ^ offered_coins
+        non_offer_removals: Set[Coin] = set(offer.removals()) ^ offered_coins
+        await self.wallet_state_manager.add_interested_coin_ids(
+            [coin.name() for coin in (*non_offer_removals, *non_offer_additions)]
+        )
+
+        self.wallet_state_manager.state_changed("offer_added")
 
     async def create_offer_for_ids(
-        self, offer: Dict[int, int], file_name: str
-    ) -> Tuple[bool, Optional[TradeRecord], Optional[str]]:
-        success, trade_offer, error = await self._create_offer_for_ids(offer)
+        self,
+        offer: Dict[Union[int, bytes32], int],
+        tx_config: TXConfig,
+        driver_dict: Optional[Dict[bytes32, PuzzleInfo]] = None,
+        solver: Optional[Solver] = None,
+        fee: uint64 = uint64(0),
+        validate_only: bool = False,
+        extra_conditions: Tuple[Condition, ...] = tuple(),
+        taking: bool = False,
+    ) -> Union[
+        Tuple[Literal[True], TradeRecord, List[TransactionRecord], None], Tuple[Literal[False], None, List[Never], str]
+    ]:
+        if driver_dict is None:
+            driver_dict = {}
+        if solver is None:
+            solver = Solver({})
+        result = await self._create_offer_for_ids(
+            offer,
+            tx_config,
+            driver_dict,
+            solver,
+            fee=fee,
+            extra_conditions=extra_conditions,
+            taking=taking,
+        )
+        if not result[0] or result[1] is None:
+            raise Exception(f"Error creating offer: {result[2]}")
 
-        if success is True and trade_offer is not None:
-            self.write_offer_to_disk(Path(file_name), trade_offer)
-            await self.save_trade(trade_offer)
+        success, created_offer, tx_records, error = result
 
-        return success, trade_offer, error
+        now = uint64(int(time.time()))
+        trade_offer: TradeRecord = TradeRecord(
+            confirmed_at_index=uint32(0),
+            accepted_at_time=None,
+            created_at_time=now,
+            is_my_offer=True,
+            sent=uint32(0),
+            offer=bytes(created_offer),
+            taken_offer=None,
+            coins_of_interest=created_offer.get_involved_coins(),
+            trade_id=created_offer.name(),
+            status=uint32(TradeStatus.PENDING_ACCEPT.value),
+            sent_to=[],
+            valid_times=parse_timelock_info(extra_conditions),
+        )
 
-    async def _create_offer_for_ids(self, offer: Dict[int, int]) -> Tuple[bool, Optional[TradeRecord], Optional[str]]:
+        if success is True and trade_offer is not None and not validate_only:
+            await self.save_trade(trade_offer, created_offer)
+
+        return success, trade_offer, tx_records, error
+
+    async def _create_offer_for_ids(
+        self,
+        offer_dict: Dict[Union[int, bytes32], int],
+        tx_config: TXConfig,
+        driver_dict: Optional[Dict[bytes32, PuzzleInfo]] = None,
+        solver: Optional[Solver] = None,
+        fee: uint64 = uint64(0),
+        extra_conditions: Tuple[Condition, ...] = tuple(),
+        taking: bool = False,
+    ) -> Union[
+        Tuple[Literal[True], Offer, List[TransactionRecord], None], Tuple[Literal[False], None, List[Never], str]
+    ]:
         """
         Offer is dictionary of wallet ids and amount
         """
-        spend_bundle = None
+        if driver_dict is None:
+            driver_dict = {}
+        if solver is None:
+            solver = Solver({})
         try:
-            for id in offer.keys():
-                amount = offer[id]
-                wallet_id = uint32(int(id))
-                wallet = self.wallet_state_manager.wallets[wallet_id]
-                if isinstance(wallet, CCWallet):
-                    balance = await wallet.get_confirmed_balance()
-                    if balance < abs(amount) and amount < 0:
-                        raise Exception(f"insufficient funds in wallet {wallet_id}")
-                    if amount > 0:
-                        if spend_bundle is None:
-                            to_exclude: List[Coin] = []
-                        else:
-                            to_exclude = spend_bundle.removals()
-                        zero_spend_bundle: SpendBundle = await wallet.generate_zero_val_coin(False, to_exclude)
-
-                        if spend_bundle is None:
-                            spend_bundle = zero_spend_bundle
-                        else:
-                            spend_bundle = SpendBundle.aggregate([spend_bundle, zero_spend_bundle])
-
-                        additions = zero_spend_bundle.additions()
-                        removals = zero_spend_bundle.removals()
-                        zero_val_coin: Optional[Coin] = None
-                        for add in additions:
-                            if add not in removals and add.amount == 0:
-                                zero_val_coin = add
-                        new_spend_bundle = await wallet.create_spend_bundle_relative_amount(amount, zero_val_coin)
+            coins_to_offer: Dict[Union[int, bytes32], Set[Coin]] = {}
+            requested_payments: Dict[Optional[bytes32], List[Payment]] = {}
+            offer_dict_no_ints: Dict[Optional[bytes32], int] = {}
+            for id, amount in offer_dict.items():
+                asset_id: Optional[bytes32] = None
+                # asset_id can either be none if asset is GL or
+                # bytes32 if another asset (e.g. NFT, CAT)
+                if amount > 0:
+                    # this is what we are receiving in the trade
+                    memos: List[bytes] = []
+                    if isinstance(id, int):
+                        wallet_id = uint32(id)
+                        wallet = self.wallet_state_manager.wallets[wallet_id]
+                        p2_ph: bytes32 = await wallet.get_puzzle_hash(new=not tx_config.reuse_puzhash)
+                        if wallet.type() != WalletType.STANDARD_WALLET:
+                            if callable(getattr(wallet, "get_asset_id", None)):  # ATTENTION: new wallets
+                                asset_id = bytes32(bytes.fromhex(wallet.get_asset_id()))
+                                memos = [p2_ph]
+                            else:
+                                raise ValueError(
+                                    f"Cannot request assets from wallet id {wallet.id()} without more information"
+                                )
                     else:
-                        new_spend_bundle = await wallet.create_spend_bundle_relative_amount(amount)
-                elif isinstance(wallet, Wallet):
-                    if spend_bundle is None:
-                        to_exclude = []
-                    else:
-                        to_exclude = spend_bundle.removals()
-                    new_spend_bundle = await wallet.create_spend_bundle_relative_chia(amount, to_exclude)
-                else:
-                    return False, None, "unsupported wallet type"
-                if new_spend_bundle is None or new_spend_bundle.removals() == []:
-                    raise Exception(f"Wallet {id} was unable to create offer.")
-                if spend_bundle is None:
-                    spend_bundle = new_spend_bundle
-                else:
-                    spend_bundle = SpendBundle.aggregate([spend_bundle, new_spend_bundle])
-
-            if spend_bundle is None:
-                return False, None, None
-
-            now = uint64(int(time.time()))
-            trade_offer: TradeRecord = TradeRecord(
-                confirmed_at_index=uint32(0),
-                accepted_at_time=None,
-                created_at_time=now,
-                my_offer=True,
-                sent=uint32(0),
-                spend_bundle=spend_bundle,
-                tx_spend_bundle=None,
-                additions=spend_bundle.additions(),
-                removals=spend_bundle.removals(),
-                trade_id=std_hash(spend_bundle.name() + bytes(now)),
-                status=uint32(TradeStatus.PENDING_ACCEPT.value),
-                sent_to=[],
-            )
-            return True, trade_offer, None
-        except Exception as e:
-            tb = traceback.format_exc()
-            self.log.error(f"Error with creating trade offer: {type(e)}{tb}")
-            return False, None, str(e)
-
-    def write_offer_to_disk(self, file_path: Path, offer: TradeRecord):
-        if offer is not None:
-            file_path.write_text(bytes(offer).hex())
-
-    async def get_discrepancies_for_offer(self, file_path: Path) -> Tuple[bool, Optional[Dict], Optional[Exception]]:
-        self.log.info(f"trade offer: {file_path}")
-        trade_offer_hex = file_path.read_text()
-        trade_offer = TradeRecord.from_bytes(bytes.fromhex(trade_offer_hex))
-        return get_discrepancies_for_spend_bundle(trade_offer.spend_bundle)
-
-    async def get_inner_puzzle_for_puzzle_hash(self, puzzle_hash) -> Program:
-        info = await self.wallet_state_manager.puzzle_store.get_derivation_record_for_puzzle_hash(puzzle_hash)
-        assert info is not None
-        puzzle = self.wallet_state_manager.main_wallet.puzzle_for_pk(bytes(info.pubkey))
-        return puzzle
-
-    async def maybe_create_wallets_for_offer(self, file_path: Path) -> bool:
-        success, result, error = await self.get_discrepancies_for_offer(file_path)
-        if not success or result is None:
-            return False
-
-        for key, value in result.items():
-            wsm = self.wallet_state_manager
-            wallet: Wallet = wsm.main_wallet
-            if key == "chia":
-                continue
-            self.log.info(f"value is {key}")
-            exists = await wsm.get_wallet_for_colour(key)
-            if exists is not None:
-                continue
-
-            await CCWallet.create_wallet_for_cc(wsm, wallet, key)
-
-        return True
-
-    async def respond_to_offer(self, file_path: Path) -> Tuple[bool, Optional[TradeRecord], Optional[str]]:
-        has_wallets = await self.maybe_create_wallets_for_offer(file_path)
-        if not has_wallets:
-            return False, None, "Unknown Error"
-        trade_offer = None
-        try:
-            trade_offer_hex = file_path.read_text()
-            trade_offer = TradeRecord.from_bytes(hexstr_to_bytes(trade_offer_hex))
-        except Exception as e:
-            return False, None, f"Error: {e}"
-        if trade_offer is not None:
-            offer_spend_bundle: SpendBundle = trade_offer.spend_bundle
-
-        coinsols: List[CoinSpend] = []  # [] of CoinSpends
-        cc_coinsol_outamounts: Dict[bytes32, List[Tuple[CoinSpend, int]]] = dict()
-        aggsig = offer_spend_bundle.aggregated_signature
-        cc_discrepancies: Dict[bytes32, int] = dict()
-        chia_discrepancy = None
-        wallets: Dict[bytes32, Any] = dict()  # colour to wallet dict
-
-        for coinsol in offer_spend_bundle.coin_spends:
-            puzzle: Program = Program.from_bytes(bytes(coinsol.puzzle_reveal))
-            solution: Program = Program.from_bytes(bytes(coinsol.solution))
-
-            # work out the deficits between coin amount and expected output for each
-            r = cc_utils.uncurry_cc(puzzle)
-            if r:
-                # Calculate output amounts
-                mod_hash, genesis_checker, inner_puzzle = r
-                colour = bytes(genesis_checker).hex()
-                if colour not in wallets:
-                    wallets[colour] = await self.wallet_state_manager.get_wallet_for_colour(colour)
-                unspent = await self.wallet_state_manager.get_spendable_coins_for_wallet(wallets[colour].id())
-                if coinsol.coin in [record.coin for record in unspent]:
-                    return False, None, "can't respond to own offer"
-
-                innersol = solution.first()
-
-                total = get_output_amount_for_puzzle_and_solution(inner_puzzle, innersol)
-                if colour in cc_discrepancies:
-                    cc_discrepancies[colour] += coinsol.coin.amount - total
-                else:
-                    cc_discrepancies[colour] = coinsol.coin.amount - total
-                # Store coinsol and output amount for later
-                if colour in cc_coinsol_outamounts:
-                    cc_coinsol_outamounts[colour].append((coinsol, total))
-                else:
-                    cc_coinsol_outamounts[colour] = [(coinsol, total)]
-
-            else:
-                # standard chia coin
-                unspent = await self.wallet_state_manager.get_spendable_coins_for_wallet(1)
-                if coinsol.coin in [record.coin for record in unspent]:
-                    return False, None, "can't respond to own offer"
-                if chia_discrepancy is None:
-                    chia_discrepancy = get_output_discrepancy_for_puzzle_and_solution(coinsol.coin, puzzle, solution)
-                else:
-                    chia_discrepancy += get_output_discrepancy_for_puzzle_and_solution(coinsol.coin, puzzle, solution)
-                coinsols.append(coinsol)
-
-        chia_spend_bundle: Optional[SpendBundle] = None
-        if chia_discrepancy is not None:
-            chia_spend_bundle = await self.wallet_state_manager.main_wallet.create_spend_bundle_relative_chia(
-                chia_discrepancy, []
-            )
-            if chia_spend_bundle is not None:
-                for coinsol in coinsols:
-                    chia_spend_bundle.coin_spends.append(coinsol)
-
-        zero_spend_list: List[SpendBundle] = []
-        spend_bundle = None
-        # create coloured coin
-        self.log.info(cc_discrepancies)
-        for colour in cc_discrepancies.keys():
-            if cc_discrepancies[colour] < 0:
-                my_cc_spends = await wallets[colour].select_coins(abs(cc_discrepancies[colour]))
-            else:
-                if chia_spend_bundle is None:
-                    to_exclude: List = []
-                else:
-                    to_exclude = chia_spend_bundle.removals()
-                my_cc_spends = await wallets[colour].select_coins(0)
-                if my_cc_spends is None or my_cc_spends == set():
-                    zero_spend_bundle: SpendBundle = await wallets[colour].generate_zero_val_coin(False, to_exclude)
-                    if zero_spend_bundle is None:
-                        return (
-                            False,
-                            None,
-                            "Unable to generate zero value coin. Confirm that you have gl available",
+                        p2_ph = await self.wallet_state_manager.main_wallet.get_puzzle_hash(
+                            new=not tx_config.reuse_puzhash
                         )
-                    zero_spend_list.append(zero_spend_bundle)
+                        asset_id = id
+                        wallet = await self.wallet_state_manager.get_wallet_for_asset_id(asset_id.hex())
+                        memos = [p2_ph]
+                    requested_payments[asset_id] = [Payment(p2_ph, uint64(amount), memos)]
+                elif amount < 0:
+                    # this is what we are sending in the trade
+                    if isinstance(id, int):
+                        wallet_id = uint32(id)
+                        wallet = self.wallet_state_manager.wallets[wallet_id]
+                        if wallet.type() != WalletType.STANDARD_WALLET:
+                            if callable(getattr(wallet, "get_asset_id", None)):  # ATTENTION: new wallets
+                                asset_id = bytes32(bytes.fromhex(wallet.get_asset_id()))
+                            else:
+                                raise ValueError(
+                                    f"Cannot offer assets from wallet id {wallet.id()} without more information"
+                                )
+                    else:
+                        asset_id = id
+                        wallet = await self.wallet_state_manager.get_wallet_for_asset_id(asset_id.hex())
+                    if not callable(getattr(wallet, "get_coins_to_offer", None)):  # ATTENTION: new wallets
+                        raise ValueError(f"Cannot offer coins from wallet id {wallet.id()}")
+                    # For the GL wallet also include the fee amount to the coins we use to pay this offer
+                    amount_to_select = abs(amount)
+                    if wallet.type() == WalletType.STANDARD_WALLET:
+                        amount_to_select += fee
+                    coins_to_offer[id] = await wallet.get_coins_to_offer(
+                        asset_id, uint64(amount_to_select), tx_config.coin_selection_config
+                    )
+                    # Note: if we use check_for_special_offer_making, this is not used.
+                elif amount == 0:
+                    raise ValueError("You cannot offer nor request 0 amount of something")
 
-                    additions = zero_spend_bundle.additions()
-                    removals = zero_spend_bundle.removals()
-                    my_cc_spends = set()
-                    for add in additions:
-                        if add not in removals and add.amount == 0:
-                            my_cc_spends.add(add)
+                offer_dict_no_ints[asset_id] = amount
 
-            if my_cc_spends == set() or my_cc_spends is None:
-                return False, None, "insufficient funds"
+                if asset_id is not None and wallet is not None:  # if this asset is not GL
+                    if callable(getattr(wallet, "get_puzzle_info", None)):
+                        puzzle_driver: PuzzleInfo = await wallet.get_puzzle_info(asset_id)
+                        if asset_id in driver_dict and driver_dict[asset_id] != puzzle_driver:
+                            # ignore the case if we're an nft transferring the did owner
+                            if self.check_for_owner_change_in_drivers(puzzle_driver, driver_dict[asset_id]):
+                                driver_dict[asset_id] = puzzle_driver
+                            else:
+                                raise ValueError(
+                                    f"driver_dict specified {driver_dict[asset_id]}, was expecting {puzzle_driver}"
+                                )
+                        else:
+                            driver_dict[asset_id] = puzzle_driver
+                    else:
+                        raise ValueError(f"Wallet for asset id {asset_id} is not properly integrated with TradeManager")
 
-            # Create SpendableCC list and innersol_list with both my coins and the offered coins
-            # Firstly get the output coin
-            my_output_coin = my_cc_spends.pop()
-            spendable_cc_list = []
-            innersol_list = []
-            genesis_id = genesis_coin_id_for_genesis_coin_checker(Program.from_bytes(bytes.fromhex(colour)))
-            # Make the rest of the coins assert the output coin is consumed
-            for coloured_coin in my_cc_spends:
-                inner_solution = self.wallet_state_manager.main_wallet.make_solution(consumed=[my_output_coin.name()])
-                inner_puzzle = await self.get_inner_puzzle_for_puzzle_hash(coloured_coin.puzzle_hash)
-                assert inner_puzzle is not None
-
-                sigs = await wallets[colour].get_sigs(inner_puzzle, inner_solution, coloured_coin.name())
-                sigs.append(aggsig)
-                aggsig = AugSchemeMPL.aggregate(sigs)
-
-                lineage_proof = await wallets[colour].get_lineage_proof_for_coin(coloured_coin)
-                spendable_cc_list.append(SpendableCC(coloured_coin, genesis_id, inner_puzzle, lineage_proof))
-                innersol_list.append(inner_solution)
-
-            # Create SpendableCC for each of the coloured coins received
-            for cc_coinsol_out in cc_coinsol_outamounts[colour]:
-                cc_coinsol = cc_coinsol_out[0]
-                puzzle = Program.from_bytes(bytes(cc_coinsol.puzzle_reveal))
-                solution = Program.from_bytes(bytes(cc_coinsol.solution))
-
-                r = uncurry_cc(puzzle)
-                if r:
-                    mod_hash, genesis_coin_checker, inner_puzzle = r
-                    inner_solution = solution.first()
-                    lineage_proof = solution.rest().rest().first()
-                    spendable_cc_list.append(SpendableCC(cc_coinsol.coin, genesis_id, inner_puzzle, lineage_proof))
-                    innersol_list.append(inner_solution)
-
-            # Finish the output coin SpendableCC with new information
-            newinnerpuzhash = await wallets[colour].get_new_inner_hash()
-            outputamount = sum([c.amount for c in my_cc_spends]) + cc_discrepancies[colour] + my_output_coin.amount
-            inner_solution = self.wallet_state_manager.main_wallet.make_solution(
-                primaries=[{"puzzlehash": newinnerpuzhash, "amount": outputamount}]
+            requested_payments = await self.check_for_requested_payment_modifications(
+                requested_payments, driver_dict, taking
             )
-            inner_puzzle = await self.get_inner_puzzle_for_puzzle_hash(my_output_coin.puzzle_hash)
-            assert inner_puzzle is not None
 
-            lineage_proof = await wallets[colour].get_lineage_proof_for_coin(my_output_coin)
-            spendable_cc_list.append(SpendableCC(my_output_coin, genesis_id, inner_puzzle, lineage_proof))
-            innersol_list.append(inner_solution)
-
-            sigs = await wallets[colour].get_sigs(inner_puzzle, inner_solution, my_output_coin.name())
-            sigs.append(aggsig)
-            aggsig = AugSchemeMPL.aggregate(sigs)
-            if spend_bundle is None:
-                spend_bundle = spend_bundle_for_spendable_ccs(
-                    CC_MOD,
-                    Program.from_bytes(bytes.fromhex(colour)),
-                    spendable_cc_list,
-                    innersol_list,
-                    [aggsig],
+            potential_special_offer: Optional[Tuple[Offer, List[TransactionRecord]]] = (
+                await self.check_for_special_offer_making(
+                    offer_dict_no_ints,
+                    driver_dict,
+                    tx_config,
+                    solver,
+                    fee,
+                    extra_conditions,
                 )
-            else:
-                new_spend_bundle = spend_bundle_for_spendable_ccs(
-                    CC_MOD,
-                    Program.from_bytes(bytes.fromhex(colour)),
-                    spendable_cc_list,
-                    innersol_list,
-                    [aggsig],
-                )
-                spend_bundle = SpendBundle.aggregate([spend_bundle, new_spend_bundle])
-            # reset sigs and aggsig so that they aren't included next time around
-            sigs = []
-            aggsig = AugSchemeMPL.aggregate(sigs)
-        my_tx_records = []
-        if zero_spend_list is not None and spend_bundle is not None:
-            zero_spend_list.append(spend_bundle)
-            spend_bundle = SpendBundle.aggregate(zero_spend_list)
+            )
 
-        if spend_bundle is None:
-            return False, None, "spend_bundle missing"
+            if potential_special_offer is not None:
+                return True, potential_special_offer[0], potential_special_offer[1], None
 
-        # Add transaction history for this trade
-        now = uint64(int(time.time()))
-        if chia_spend_bundle is not None:
-            spend_bundle = SpendBundle.aggregate([spend_bundle, chia_spend_bundle])
-            if chia_discrepancy < 0:
-                tx_record = TransactionRecord(
-                    confirmed_at_height=uint32(0),
-                    created_at_time=now,
-                    to_puzzle_hash=token_bytes(),
-                    amount=uint64(abs(chia_discrepancy)),
-                    fee_amount=uint64(0),
-                    confirmed=False,
-                    sent=uint32(10),
-                    spend_bundle=chia_spend_bundle,
-                    additions=chia_spend_bundle.additions(),
-                    removals=chia_spend_bundle.removals(),
-                    wallet_id=uint32(1),
-                    sent_to=[],
-                    trade_id=std_hash(spend_bundle.name() + bytes(now)),
-                    type=uint32(TransactionType.OUTGOING_TRADE.value),
-                    name=chia_spend_bundle.name(),
+            all_coins: List[Coin] = [c for coins in coins_to_offer.values() for c in coins]
+            notarized_payments: Dict[Optional[bytes32], List[NotarizedPayment]] = Offer.notarize_payments(
+                requested_payments, all_coins
+            )
+            announcements_to_assert = Offer.calculate_announcements(notarized_payments, driver_dict)
+
+            all_transactions: List[TransactionRecord] = []
+            fee_left_to_pay: uint64 = fee
+            # The access of the sorted keys here makes sure we create the GL transaction first to make sure we pay fee
+            # with the GL side of the offer and don't create an extra fee transaction in other wallets.
+            for id in sorted(coins_to_offer.keys(), key=lambda id: id != 1):
+                selected_coins = coins_to_offer[id]
+                if isinstance(id, int):
+                    wallet = self.wallet_state_manager.wallets[id]
+                else:
+                    wallet = await self.wallet_state_manager.get_wallet_for_asset_id(id.hex())
+                # This should probably not switch on whether or not we're spending GL but it has to for now
+                if wallet.type() == WalletType.STANDARD_WALLET:
+                    [tx] = await wallet.generate_signed_transaction(
+                        abs(offer_dict[id]),
+                        Offer.ph(),
+                        tx_config,
+                        fee=fee_left_to_pay,
+                        coins=selected_coins,
+                        extra_conditions=(*extra_conditions, *announcements_to_assert),
+                    )
+                    all_transactions.append(tx)
+                elif wallet.type() == WalletType.NFT:
+                    # This is to generate the tx for specific nft assets, i.e. not using
+                    # wallet_id as the selector which would select any coins from nft_wallet
+                    amounts = [coin.amount for coin in selected_coins]
+                    txs = await wallet.generate_signed_transaction(
+                        # [abs(offer_dict[id])],
+                        amounts,
+                        [Offer.ph()],
+                        tx_config,
+                        fee=fee_left_to_pay,
+                        coins=selected_coins,
+                        extra_conditions=(*extra_conditions, *announcements_to_assert),
+                    )
+                    all_transactions.extend(txs)
+                else:
+                    # ATTENTION: new_wallets
+                    txs = await wallet.generate_signed_transaction(
+                        [abs(offer_dict[id])],
+                        [Offer.ph()],
+                        tx_config,
+                        fee=fee_left_to_pay,
+                        coins=selected_coins,
+                        extra_conditions=(*extra_conditions, *announcements_to_assert),
+                        add_authorizations_to_cr_cats=False,
+                    )
+                    all_transactions.extend(txs)
+
+                fee_left_to_pay = uint64(0)
+                extra_conditions = tuple()
+
+            total_spend_bundle = SpendBundle.aggregate(
+                [x.spend_bundle for x in all_transactions if x.spend_bundle is not None]
+            )
+
+            offer = Offer(notarized_payments, total_spend_bundle, driver_dict)
+            return True, offer, all_transactions, None
+
+        except Exception as e:
+            self.log.exception("Error creating trade offer")
+            return False, None, [], str(e)
+
+    async def maybe_create_wallets_for_offer(self, offer: Offer) -> None:
+        for key in offer.arbitrage():
+            wsm = self.wallet_state_manager
+            if key is None:
+                continue
+            # ATTENTION: new_wallets
+            exists: Optional[Wallet] = await wsm.get_wallet_for_puzzle_info(offer.driver_dict[key])
+            if exists is None:
+                await wsm.create_wallet_for_puzzle_info(offer.driver_dict[key])
+
+    async def check_offer_validity(self, offer: Offer, peer: WSGoldConnection) -> bool:
+        all_removals: List[Coin] = offer.removals()
+        all_removal_names: List[bytes32] = [c.name() for c in all_removals]
+        non_ephemeral_removals: List[Coin] = list(
+            filter(lambda c: c.parent_coin_info not in all_removal_names, all_removals)
+        )
+        coin_states = await self.wallet_state_manager.wallet_node.get_coin_state(
+            [c.name() for c in non_ephemeral_removals], peer=peer
+        )
+
+        return len(coin_states) == len(non_ephemeral_removals) and all([cs.spent_height is None for cs in coin_states])
+
+    async def calculate_tx_records_for_offer(self, offer: Offer, validate: bool) -> List[TransactionRecord]:
+        if validate:
+            final_spend_bundle: SpendBundle = offer.to_valid_spend()
+            hint_dict: Dict[bytes32, bytes32] = {}
+            additions_dict: Dict[bytes32, Coin] = {}
+            for hinted_coins, _ in (
+                compute_spend_hints_and_additions(spend) for spend in final_spend_bundle.coin_spends
+            ):
+                hint_dict.update({id: hc.hint for id, hc in hinted_coins.items() if hc.hint is not None})
+                additions_dict.update({id: hc.coin for id, hc in hinted_coins.items()})
+            all_additions: List[Coin] = list(a for a in additions_dict.values())
+        else:
+            final_spend_bundle = offer._bundle
+            hint_dict = offer.hints()
+            all_additions = offer.additions()
+
+        settlement_coins: List[Coin] = [c for coins in offer.get_offered_coins().values() for c in coins]
+        settlement_coin_ids: List[bytes32] = [c.name() for c in settlement_coins]
+
+        removals: List[Coin] = final_spend_bundle.removals()
+        additions: List[Coin] = list(a for a in all_additions if a not in removals)
+        valid_times: ConditionValidTimes = parse_timelock_info(
+            parse_conditions_non_consensus(
+                condition
+                for spend in final_spend_bundle.coin_spends
+                for condition in spend.puzzle_reveal.to_program().run(spend.solution.to_program()).as_iter()
+            )
+        )
+        # this executes the puzzles again
+        all_fees = uint64(estimate_fees(final_spend_bundle))
+
+        txs = []
+
+        addition_dict: Dict[uint32, List[Coin]] = {}
+        for addition in additions:
+            wallet_identifier = await self.wallet_state_manager.get_wallet_identifier_for_coin(
+                addition,
+                hint_dict,
+            )
+            if wallet_identifier is not None:
+                if addition.parent_coin_info in settlement_coin_ids:
+                    wallet = self.wallet_state_manager.wallets[wallet_identifier.id]
+                    to_puzzle_hash = await wallet.convert_puzzle_hash(addition.puzzle_hash)  # ATTENTION: new wallets
+                    txs.append(
+                        TransactionRecord(
+                            confirmed_at_height=uint32(0),
+                            created_at_time=uint64(int(time.time())),
+                            to_puzzle_hash=to_puzzle_hash,
+                            amount=uint64(addition.amount),
+                            fee_amount=uint64(0),
+                            confirmed=False,
+                            sent=uint32(10),
+                            spend_bundle=None,
+                            additions=[addition],
+                            removals=[],
+                            wallet_id=wallet_identifier.id,
+                            sent_to=[],
+                            trade_id=offer.name(),
+                            type=uint32(TransactionType.INCOMING_TRADE.value),
+                            name=std_hash(final_spend_bundle.name() + addition.name()),
+                            memos=[(coin_id, [hint]) for coin_id, hint in hint_dict.items()],
+                            valid_times=valid_times,
+                        )
+                    )
+                else:  # This is change
+                    addition_dict.setdefault(wallet_identifier.id, [])
+                    addition_dict[wallet_identifier.id].append(addition)
+
+        # While we want additions to show up as separate records, removals of the same wallet should show as one
+        removal_dict: Dict[uint32, List[Coin]] = {}
+        for removal in removals:
+            wallet_identifier = await self.wallet_state_manager.get_wallet_identifier_for_coin(
+                removal,
+                hint_dict,
+            )
+            if wallet_identifier is not None:
+                removal_dict.setdefault(wallet_identifier.id, [])
+                removal_dict[wallet_identifier.id].append(removal)
+
+        all_removals: List[bytes32] = [r.name() for removals in removal_dict.values() for r in removals]
+
+        for wid, grouped_removals in removal_dict.items():
+            wallet = self.wallet_state_manager.wallets[wid]
+            to_puzzle_hash = bytes32([1] * 32)  # We use all zeros to be clear not to send here
+            removal_tree_hash = Program.to([coin_as_list(rem) for rem in grouped_removals]).get_tree_hash()
+            # We also need to calculate the sent amount
+            removed: int = sum(c.amount for c in grouped_removals)
+            removed_ids: List[bytes32] = [c.name() for c in grouped_removals]
+            all_additions_from_grouped_removals: List[Coin] = [
+                c for c in all_additions if c.parent_coin_info in removed_ids
+            ]
+            potential_change_coins: List[Coin] = addition_dict[wid] if wid in addition_dict else []
+            change_coins: List[Coin] = [c for c in potential_change_coins if c.parent_coin_info in all_removals]
+            change_amount: int = sum(c.amount for c in change_coins)
+            sent_amount: int = (
+                removed
+                - change_amount
+                - (
+                    removed - sum(c.amount for c in all_additions_from_grouped_removals)  # removals - additions == fees
+                    if wallet == self.wallet_state_manager.main_wallet
+                    else 0
                 )
-            else:
-                tx_record = TransactionRecord(
+            )
+            txs.append(
+                TransactionRecord(
                     confirmed_at_height=uint32(0),
                     created_at_time=uint64(int(time.time())),
-                    to_puzzle_hash=token_bytes(),
-                    amount=uint64(abs(chia_discrepancy)),
-                    fee_amount=uint64(0),
+                    to_puzzle_hash=to_puzzle_hash,
+                    amount=uint64(sent_amount),
+                    fee_amount=all_fees,
                     confirmed=False,
                     sent=uint32(10),
-                    spend_bundle=chia_spend_bundle,
-                    additions=chia_spend_bundle.additions(),
-                    removals=chia_spend_bundle.removals(),
-                    wallet_id=uint32(1),
-                    sent_to=[],
-                    trade_id=std_hash(spend_bundle.name() + bytes(now)),
-                    type=uint32(TransactionType.INCOMING_TRADE.value),
-                    name=chia_spend_bundle.name(),
-                )
-            my_tx_records.append(tx_record)
-
-        for colour, amount in cc_discrepancies.items():
-            wallet = wallets[colour]
-            if chia_discrepancy > 0:
-                tx_record = TransactionRecord(
-                    confirmed_at_height=uint32(0),
-                    created_at_time=uint64(int(time.time())),
-                    to_puzzle_hash=token_bytes(),
-                    amount=uint64(abs(amount)),
-                    fee_amount=uint64(0),
-                    confirmed=False,
-                    sent=uint32(10),
-                    spend_bundle=spend_bundle,
-                    additions=spend_bundle.additions(),
-                    removals=spend_bundle.removals(),
+                    spend_bundle=None,
+                    additions=change_coins,
+                    removals=grouped_removals,
                     wallet_id=wallet.id(),
                     sent_to=[],
-                    trade_id=std_hash(spend_bundle.name() + bytes(now)),
+                    trade_id=offer.name(),
                     type=uint32(TransactionType.OUTGOING_TRADE.value),
-                    name=spend_bundle.name(),
+                    name=std_hash(final_spend_bundle.name() + removal_tree_hash),
+                    memos=[(coin_id, [hint]) for coin_id, hint in hint_dict.items()],
+                    valid_times=valid_times,
                 )
-            else:
-                tx_record = TransactionRecord(
-                    confirmed_at_height=uint32(0),
-                    created_at_time=uint64(int(time.time())),
-                    to_puzzle_hash=token_bytes(),
-                    amount=uint64(abs(amount)),
-                    fee_amount=uint64(0),
-                    confirmed=False,
-                    sent=uint32(10),
-                    spend_bundle=spend_bundle,
-                    additions=spend_bundle.additions(),
-                    removals=spend_bundle.removals(),
-                    wallet_id=wallet.id(),
-                    sent_to=[],
-                    trade_id=std_hash(spend_bundle.name() + bytes(now)),
-                    type=uint32(TransactionType.INCOMING_TRADE.value),
-                    name=token_bytes(),
-                )
-            my_tx_records.append(tx_record)
+            )
 
-        tx_record = TransactionRecord(
+        return txs
+
+    async def respond_to_offer(
+        self,
+        offer: Offer,
+        peer: WSGoldConnection,
+        tx_config: TXConfig,
+        solver: Optional[Solver] = None,
+        fee: uint64 = uint64(0),
+        extra_conditions: Tuple[Condition, ...] = tuple(),
+    ) -> Tuple[TradeRecord, List[TransactionRecord]]:
+        if solver is None:
+            solver = Solver({})
+        take_offer_dict: Dict[Union[bytes32, int], int] = {}
+        arbitrage: Dict[Optional[bytes32], int] = offer.arbitrage()
+
+        for asset_id, amount in arbitrage.items():
+            if asset_id is None:
+                wallet = self.wallet_state_manager.main_wallet
+                key: Union[bytes32, int] = int(wallet.id())
+            else:
+                # ATTENTION: new wallets
+                wallet = await self.wallet_state_manager.get_wallet_for_asset_id(asset_id.hex())
+                if wallet is None and amount < 0:
+                    raise ValueError(f"Do not have a wallet for asset ID: {asset_id} to fulfill offer")
+                elif wallet is None or wallet.type() in [WalletType.NFT, WalletType.DATA_LAYER]:
+                    key = asset_id
+                else:
+                    key = int(wallet.id())
+            take_offer_dict[key] = amount
+
+        # First we validate that all of the coins in this offer exist
+        valid: bool = await self.check_offer_validity(offer, peer)
+        if not valid:
+            raise ValueError("This offer is no longer valid")
+        result = await self._create_offer_for_ids(
+            take_offer_dict,
+            tx_config,
+            offer.driver_dict,
+            solver,
+            fee=fee,
+            extra_conditions=extra_conditions,
+            taking=True,
+        )
+        if not result[0] or result[1] is None:
+            raise ValueError(result[2])
+
+        success, take_offer, _, error = result
+
+        complete_offer, valid_spend_solver = await self.check_for_final_modifications(
+            Offer.aggregate([offer, take_offer]), solver, tx_config
+        )
+        self.log.info("COMPLETE OFFER: %s", complete_offer.to_bech32())
+        assert complete_offer.is_valid()
+        final_spend_bundle: SpendBundle = complete_offer.to_valid_spend(
+            solver=Solver({**valid_spend_solver.info, **solver.info})
+        )
+        await self.maybe_create_wallets_for_offer(complete_offer)
+
+        tx_records: List[TransactionRecord] = await self.calculate_tx_records_for_offer(complete_offer, True)
+
+        trade_record: TradeRecord = TradeRecord(
+            confirmed_at_index=uint32(0),
+            accepted_at_time=uint64(int(time.time())),
+            created_at_time=uint64(int(time.time())),
+            is_my_offer=False,
+            sent=uint32(0),
+            offer=bytes(complete_offer),
+            taken_offer=bytes(offer),
+            coins_of_interest=complete_offer.get_involved_coins(),
+            trade_id=complete_offer.name(),
+            status=uint32(TradeStatus.PENDING_CONFIRM.value),
+            sent_to=[],
+            valid_times=parse_timelock_info(extra_conditions),
+        )
+
+        await self.save_trade(trade_record, offer)
+
+        # Dummy transaction for the sake of the wallet push
+        push_tx = TransactionRecord(
             confirmed_at_height=uint32(0),
             created_at_time=uint64(int(time.time())),
-            to_puzzle_hash=token_bytes(),
+            to_puzzle_hash=bytes32([1] * 32),
             amount=uint64(0),
             fee_amount=uint64(0),
             confirmed=False,
             sent=uint32(0),
-            spend_bundle=spend_bundle,
-            additions=spend_bundle.additions(),
-            removals=spend_bundle.removals(),
+            spend_bundle=final_spend_bundle,
+            additions=final_spend_bundle.additions(),
+            removals=final_spend_bundle.removals(),
             wallet_id=uint32(0),
             sent_to=[],
-            trade_id=std_hash(spend_bundle.name() + bytes(now)),
+            trade_id=bytes32([1] * 32),
             type=uint32(TransactionType.OUTGOING_TRADE.value),
-            name=spend_bundle.name(),
+            name=final_spend_bundle.name(),
+            memos=[],
+            valid_times=ConditionValidTimes(),
         )
 
-        now = uint64(int(time.time()))
-        trade_record: TradeRecord = TradeRecord(
-            confirmed_at_index=uint32(0),
-            accepted_at_time=now,
-            created_at_time=now,
-            my_offer=False,
-            sent=uint32(0),
-            spend_bundle=offer_spend_bundle,
-            tx_spend_bundle=spend_bundle,
-            additions=spend_bundle.additions(),
-            removals=spend_bundle.removals(),
-            trade_id=std_hash(spend_bundle.name() + bytes(now)),
-            status=uint32(TradeStatus.PENDING_CONFIRM.value),
-            sent_to=[],
-        )
+        return trade_record, [push_tx, *tx_records]
 
-        await self.save_trade(trade_record)
-        await self.wallet_state_manager.add_pending_transaction(tx_record)
-        for tx in my_tx_records:
-            await self.wallet_state_manager.add_transaction(tx)
+    async def check_for_special_offer_making(
+        self,
+        offer_dict: Dict[Optional[bytes32], int],
+        driver_dict: Dict[bytes32, PuzzleInfo],
+        tx_config: TXConfig,
+        solver: Solver,
+        fee: uint64 = uint64(0),
+        extra_conditions: Tuple[Condition, ...] = tuple(),
+    ) -> Optional[Tuple[Offer, List[TransactionRecord]]]:
+        for puzzle_info in driver_dict.values():
+            if (
+                puzzle_info.check_type([AssetType.SINGLETON.value, AssetType.METADATA.value, AssetType.OWNERSHIP.value])
+                and isinstance(puzzle_info.also().also()["transfer_program"], PuzzleInfo)  # type: ignore
+                and puzzle_info.also().also()["transfer_program"].type()  # type: ignore
+                == AssetType.ROYALTY_TRANSFER_PROGRAM.value
+            ):
+                return await NFTWallet.make_nft1_offer(
+                    self.wallet_state_manager, offer_dict, driver_dict, tx_config, fee, extra_conditions
+                )
+            elif (
+                puzzle_info.check_type(
+                    [
+                        AssetType.SINGLETON.value,
+                        AssetType.METADATA.value,
+                    ]
+                )
+                and puzzle_info.also()["updater_hash"] == ACS_MU_PH  # type: ignore
+            ):
+                return await DataLayerWallet.make_update_offer(
+                    self.wallet_state_manager, offer_dict, driver_dict, solver, tx_config, fee, extra_conditions
+                )
+        return None
 
-        return True, trade_record, None
+    def check_for_owner_change_in_drivers(self, puzzle_info: PuzzleInfo, driver_info: PuzzleInfo) -> bool:
+        if puzzle_info.check_type(
+            [
+                AssetType.SINGLETON.value,
+                AssetType.METADATA.value,
+                AssetType.OWNERSHIP.value,
+            ]
+        ) and driver_info.check_type(
+            [
+                AssetType.SINGLETON.value,
+                AssetType.METADATA.value,
+                AssetType.OWNERSHIP.value,
+            ]
+        ):
+            old_owner = driver_info.also().also().info["owner"]  # type: ignore
+            puzzle_info.also().also().info["owner"] = old_owner  # type: ignore
+            if driver_info == puzzle_info:
+                return True
+        return False
+
+    async def get_offer_summary(self, offer: Offer) -> Dict[str, Any]:
+        for puzzle_info in offer.driver_dict.values():
+            if (
+                puzzle_info.check_type(
+                    [
+                        AssetType.SINGLETON.value,
+                        AssetType.METADATA.value,
+                    ]
+                )
+                and puzzle_info.also()["updater_hash"] == ACS_MU_PH  # type: ignore
+            ):
+                return await DataLayerWallet.get_offer_summary(offer)
+        # Otherwise just return the same thing as the RPC normally does
+        offered, requested, infos, valid_times = offer.summary()
+        return {
+            "offered": offered,
+            "requested": requested,
+            "fees": offer.fees(),
+            "additions": [c.name().hex() for c in offer.additions()],
+            "removals": [c.name().hex() for c in offer.removals()],
+            "infos": infos,
+            "valid_times": {
+                k: v
+                for k, v in valid_times.to_json_dict().items()
+                if k
+                not in (
+                    "max_secs_after_created",
+                    "min_secs_since_created",
+                    "max_blocks_after_created",
+                    "min_blocks_since_created",
+                )
+            },
+        }
+
+    async def check_for_final_modifications(
+        self, offer: Offer, solver: Solver, tx_config: TXConfig
+    ) -> Tuple[Offer, Solver]:
+        for puzzle_info in offer.driver_dict.values():
+            if (
+                puzzle_info.check_type(
+                    [
+                        AssetType.SINGLETON.value,
+                        AssetType.METADATA.value,
+                    ]
+                )
+                and puzzle_info.also()["updater_hash"] == ACS_MU_PH  # type: ignore
+            ):
+                return (await DataLayerWallet.finish_graftroot_solutions(offer, solver), Solver({}))
+            elif puzzle_info.check_type(
+                [
+                    AssetType.CAT.value,
+                    AssetType.CR.value,
+                ]
+            ):
+                # get VC wallet
+                for _, wallet in self.wallet_state_manager.wallets.items():
+                    if WalletType(wallet.type()) == WalletType.VC:
+                        assert isinstance(wallet, VCWallet)
+                        return await wallet.add_vc_authorization(offer, solver, tx_config)
+                else:
+                    raise ValueError("No VCs to approve CR-CATs with")  # pragma: no cover
+
+        return offer, Solver({})
+
+    async def check_for_requested_payment_modifications(
+        self,
+        requested_payments: Dict[Optional[bytes32], List[Payment]],
+        driver_dict: Dict[bytes32, PuzzleInfo],
+        taking: bool,
+    ) -> Dict[Optional[bytes32], List[Payment]]:
+        # This function exclusively deals with CR-CATs for now
+        if not taking:
+            for asset_id, puzzle_info in driver_dict.items():
+                if puzzle_info.check_type(
+                    [
+                        AssetType.CAT.value,
+                        AssetType.CR.value,
+                    ]
+                ):
+                    vc = await (
+                        await self.wallet_state_manager.get_or_create_vc_wallet()
+                    ).get_vc_with_provider_in_and_proofs(
+                        puzzle_info["also"]["authorized_providers"],
+                        ProofsChecker.from_program(uncurry_puzzle(puzzle_info["also"]["proofs_checker"])).flags,
+                    )
+                    if vc is None:
+                        raise ValueError("Cannot request CR-CATs that you cannot approve with a VC")  # pragma: no cover
+
+            return {
+                asset_id: (
+                    [
+                        dataclasses.replace(
+                            payment,
+                            puzzle_hash=construct_pending_approval_state(
+                                payment.puzzle_hash, payment.amount
+                            ).get_tree_hash(),
+                        )
+                        for payment in payments
+                    ]
+                    if asset_id is not None
+                    and driver_dict[asset_id].check_type(
+                        [
+                            AssetType.CAT.value,
+                            AssetType.CR.value,
+                        ]
+                    )
+                    else payments
+                )
+                for asset_id, payments in requested_payments.items()
+            }
+        else:
+            return requested_payments

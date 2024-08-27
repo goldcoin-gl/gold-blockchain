@@ -1,0 +1,16 @@
+[Unit]
+Description=Gold Daemon Service for %i
+StopWhenUnneeded=true
+
+[Service]
+Type=simple
+Environment=GOLD_ROOT=/home/%i/.gold/mainnet
+ExecStart=/opt/gold/gold_daemon
+ExecStartPost=/bin/bash -c '(while ! nc -z -v -w1 localhost 55524 2>/dev/null; do echo "Waiting for the daemon to listen on port 55524..."; sleep 1; done); sleep 1'
+User=%i
+Group=%i
+LimitNOFILE=1048576
+LimitNPROC=1048576
+
+[Install]
+WantedBy=multi-user.target

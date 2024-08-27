@@ -1,48 +1,42 @@
+from __future__ import annotations
+
 from io import TextIOWrapper
 from typing import Optional
 
 import click
 
 from chia import __version__
+from chia.cmds.beta import beta_cmd
+from chia.cmds.completion import completion
 from chia.cmds.configure import configure_cmd
+from chia.cmds.dao import dao_cmd
+from chia.cmds.data import data_cmd
+from chia.cmds.db import db_cmd
+from chia.cmds.dev import dev_cmd
 from chia.cmds.farm import farm_cmd
 from chia.cmds.init import init_cmd
 from chia.cmds.keys import keys_cmd
 from chia.cmds.netspace import netspace_cmd
 from chia.cmds.passphrase import passphrase_cmd
+from chia.cmds.peer import peer_cmd
 from chia.cmds.plotnft import plotnft_cmd
 from chia.cmds.plots import plots_cmd
 from chia.cmds.plotters import plotters_cmd
+from chia.cmds.rpc import rpc_cmd
 from chia.cmds.show import show_cmd
 from chia.cmds.start import start_cmd
 from chia.cmds.stop import stop_cmd
 from chia.cmds.wallet import wallet_cmd
 from chia.util.default_root import DEFAULT_KEYS_ROOT_PATH, DEFAULT_ROOT_PATH
-from chia.util.keychain import set_keys_root_path, supports_keyring_passphrase
+from chia.util.errors import KeychainCurrentPassphraseIsInvalid
+from chia.util.keychain import Keychain, set_keys_root_path
 from chia.util.ssl_check import check_ssl
 
 CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"])
-DIST_NAME = "Venus"
-
-
-def monkey_patch_click() -> None:
-    # this hacks around what seems to be an incompatibility between the python from `pyinstaller`
-    # and `click`
-    #
-    # Not 100% sure on the details, but it seems that `click` performs a check on start-up
-    # that `codecs.lookup(locale.getpreferredencoding()).name != 'ascii'`, and refuses to start
-    # if it's not. The python that comes with `pyinstaller` fails this check.
-    #
-    # This will probably cause problems with the command-line tools that use parameters that
-    # are not strict ascii. The real fix is likely with the `pyinstaller` python.
-
-    import click.core
-
-    click.core._verify_python3_env = lambda *args, **kwargs: 0  # type: ignore
 
 
 @click.group(
-    help=f"\n  Manage gold blockchain infrastructure ({DIST_NAME} {__version__})\n",
+    help=f"\n  Manage gold blockchain infrastructure ({__version__})\n",
     epilog="Try 'gold start node', 'gold netspace -d 192', or 'gold show -s'",
     context_settings=CONTEXT_SETTINGS,
 )
@@ -69,29 +63,34 @@ def cli(
         set_keys_root_path(Path(keys_root_path))
 
     if passphrase_file is not None:
+        import sys
+
         from chia.cmds.passphrase_funcs import cache_passphrase, read_passphrase_from_file
 
         try:
-            cache_passphrase(read_passphrase_from_file(passphrase_file))
+            passphrase = read_passphrase_from_file(passphrase_file)
+            if Keychain.master_passphrase_is_valid(passphrase):
+                cache_passphrase(passphrase)
+            else:
+                raise KeychainCurrentPassphraseIsInvalid()
+        except KeychainCurrentPassphraseIsInvalid:
+            if Path(passphrase_file.name).is_file():
+                print(f'Invalid passphrase found in "{passphrase_file.name}"')
+            else:
+                print("Invalid passphrase")
+            sys.exit(1)
         except Exception as e:
             print(f"Failed to read passphrase: {e}")
 
     check_ssl(Path(root_path))
 
 
-if not supports_keyring_passphrase():
-    from chia.cmds.passphrase_funcs import remove_passphrase_options_from_cmd
-
-    # TODO: Remove once keyring passphrase management is rolled out to all platforms
-    remove_passphrase_options_from_cmd(cli)
-
-
-@cli.command("version", short_help="Show gold version")
+@cli.command("version", help="Show gold version")
 def version_cmd() -> None:
-    print(DIST_NAME, __version__)
+    print(__version__)
 
 
-@cli.command("run_daemon", short_help="Runs gold daemon")
+@cli.command("run_daemon", help="Runs gold daemon")
 @click.option(
     "--wait-for-unlock",
     help="If the keyring is passphrase-protected, the daemon will wait for an unlock command before accessing keys",
@@ -108,7 +107,7 @@ def run_daemon_cmd(ctx: click.Context, wait_for_unlock: bool) -> None:
 
     wait_for_unlock = wait_for_unlock and Keychain.is_keyring_locked()
 
-    asyncio.get_event_loop().run_until_complete(async_run_daemon(ctx.obj["root_path"], wait_for_unlock=wait_for_unlock))
+    asyncio.run(async_run_daemon(ctx.obj["root_path"], wait_for_unlock=wait_for_unlock))
 
 
 cli.add_command(keys_cmd)
@@ -117,19 +116,24 @@ cli.add_command(wallet_cmd)
 cli.add_command(plotnft_cmd)
 cli.add_command(configure_cmd)
 cli.add_command(init_cmd)
+cli.add_command(rpc_cmd)
 cli.add_command(show_cmd)
 cli.add_command(start_cmd)
 cli.add_command(stop_cmd)
 cli.add_command(netspace_cmd)
 cli.add_command(farm_cmd)
 cli.add_command(plotters_cmd)
-
-if supports_keyring_passphrase():
-    cli.add_command(passphrase_cmd)
+cli.add_command(db_cmd)
+cli.add_command(peer_cmd)
+cli.add_command(data_cmd)
+cli.add_command(passphrase_cmd)
+cli.add_command(beta_cmd)
+cli.add_command(completion)
+cli.add_command(dao_cmd)
+cli.add_command(dev_cmd)
 
 
 def main() -> None:
-    monkey_patch_click()
     cli()  # pylint: disable=no-value-for-parameter
 
 

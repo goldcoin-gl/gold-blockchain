@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 import logging
 from decimal import Decimal
 from typing import Dict, List, Optional
 
-from blspy import G1Element
+from gold_rs import G1Element
 
 from chia.consensus.block_record import BlockRecord
 from chia.consensus.blockchain_interface import BlockchainInterface
@@ -17,9 +19,9 @@ class BlockCache(BlockchainInterface):
     def __init__(
         self,
         blocks: Dict[bytes32, BlockRecord],
-        headers: Dict[bytes32, HeaderBlock] = None,
-        height_to_hash: Dict[uint32, bytes32] = None,
-        sub_epoch_summaries: Dict[uint32, SubEpochSummary] = None,
+        headers: Optional[Dict[bytes32, HeaderBlock]] = None,
+        height_to_hash: Optional[Dict[uint32, bytes32]] = None,
+        sub_epoch_summaries: Optional[Dict[uint32, SubEpochSummary]] = None,
         inner: BlockchainInterface = None,
     ):
         if sub_epoch_summaries is None:
@@ -32,7 +34,7 @@ class BlockCache(BlockchainInterface):
         self._headers = headers
         self._height_to_hash = height_to_hash
         self._sub_epoch_summaries = sub_epoch_summaries
-        self._sub_epoch_segments: Dict[uint32, SubEpochSegments] = {}
+        self._sub_epoch_segments: Dict[bytes32, SubEpochSegments] = {}
         self.log = logging.getLogger(__name__)
         self._inner = inner
 
@@ -40,7 +42,11 @@ class BlockCache(BlockchainInterface):
         return self._block_records[header_hash]
 
     def height_to_block_record(self, height: uint32, check_db: bool = False) -> BlockRecord:
-        header_hash = self.height_to_hash(height)
+        # Precondition: height is < peak height
+
+        header_hash: Optional[bytes32] = self.height_to_hash(height)
+        assert header_hash is not None
+
         return self.block_record(header_hash)
 
     def get_ses_heights(self) -> List[uint32]:
@@ -58,6 +64,9 @@ class BlockCache(BlockchainInterface):
     def contains_block(self, header_hash: bytes32) -> bool:
         return header_hash in self._block_records
 
+    async def contains_block_from_db(self, header_hash: bytes32) -> bool:
+        return header_hash in self._block_records
+
     def contains_height(self, height: uint32) -> bool:
         return height in self._height_to_hash
 
@@ -73,10 +82,16 @@ class BlockCache(BlockchainInterface):
     async def get_block_record_from_db(self, header_hash: bytes32) -> Optional[BlockRecord]:
         return self._block_records[header_hash]
 
-    def remove_block_record(self, header_hash: bytes32):
+    async def prev_block_hash(self, header_hashes: List[bytes32]) -> List[bytes32]:
+        ret = []
+        for h in header_hashes:
+            ret.append(self._block_records[h].prev_hash)
+        return ret
+
+    def remove_block_record(self, header_hash: bytes32) -> None:
         del self._block_records[header_hash]
 
-    def add_block_record(self, block: BlockRecord):
+    def add_block_record(self, block: BlockRecord) -> None:
         self._block_records[block.header_hash] = block
 
     async def get_header_blocks_in_range(
@@ -85,15 +100,15 @@ class BlockCache(BlockchainInterface):
         return self._headers
 
     async def persist_sub_epoch_challenge_segments(
-        self, sub_epoch_summary_height: uint32, segments: List[SubEpochChallengeSegment]
-    ):
-        self._sub_epoch_segments[sub_epoch_summary_height] = SubEpochSegments(segments)
+        self, sub_epoch_summary_hash: bytes32, segments: List[SubEpochChallengeSegment]
+    ) -> None:
+        self._sub_epoch_segments[sub_epoch_summary_hash] = SubEpochSegments(segments)
 
     async def get_sub_epoch_challenge_segments(
         self,
-        sub_epoch_summary_height: uint32,
+        sub_epoch_summary_hash: bytes32,
     ) -> Optional[List[SubEpochChallengeSegment]]:
-        segments = self._sub_epoch_segments.get(sub_epoch_summary_height)
+        segments = self._sub_epoch_segments.get(sub_epoch_summary_hash)
         if segments is None:
             return None
         return segments.challenge_segments
@@ -102,3 +117,4 @@ class BlockCache(BlockchainInterface):
         self, farmer_public_key: G1Element, height: Optional[uint32] = None
     ) -> Decimal:
         return await self._inner.get_farmer_difficulty_coeff(farmer_public_key, height)
+

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from enum import Enum
 
 
@@ -54,6 +56,7 @@ class ProtocolMessageTypes(Enum):
     new_compact_vdf = 42
     request_peers = 43
     respond_peers = 44
+    none_response = 91
 
     # Wallet protocol (wallet <-> full_node)
     request_puzzle_solution = 45
@@ -86,6 +89,14 @@ class ProtocolMessageTypes(Enum):
     new_signage_point_harvester = 66
     request_plots = 67
     respond_plots = 68
+    plot_sync_start = 78
+    plot_sync_loaded = 79
+    plot_sync_removed = 80
+    plot_sync_invalid = 81
+    plot_sync_keys_missing = 82
+    plot_sync_duplicates = 83
+    plot_sync_done = 84
+    plot_sync_response = 85
 
     # More wallet protocol
     coin_state_update = 69
@@ -97,7 +108,43 @@ class ProtocolMessageTypes(Enum):
     respond_children = 75
     request_ses_hashes = 76
     respond_ses_hashes = 77
+    request_block_headers = 86
+    reject_block_headers = 87
+    respond_block_headers = 88
+    request_fee_estimates = 89
+    respond_fee_estimates = 90
+
+    # new Full Node protocol messages
+    new_unfinished_block2 = 92
+    request_unfinished_block2 = 93
+
+    # New wallet sync protocol
+    request_remove_puzzle_subscriptions = 94
+    respond_remove_puzzle_subscriptions = 95
+    request_remove_coin_subscriptions = 96
+    respond_remove_coin_subscriptions = 97
+    request_puzzle_state = 98
+    respond_puzzle_state = 99
+    # reject_puzzle_state = 100
+    # request_coin_state = 101
+    respond_coin_state = 102
+    reject_coin_state = 103
+
+    # Wallet protocol mempool updates
+    mempool_items_added = 104
+    mempool_items_removed = 105
+    request_cost_info = 106
+    respond_cost_info = 107
+
+    error = 255
 
     # Stakings
     request_stakings = 100
     respond_stakings = 101
+
+    # Fixed Old
+    reject_puzzle_state = 200
+    request_coin_state = 201
+
+    request_coin_records_by_puzzle_hash = 210
+    respond_coin_records_by_puzzle_hash = 211

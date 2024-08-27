@@ -1,20 +1,41 @@
+from __future__ import annotations
+
 import asyncio
+import contextlib
 import dataclasses
 import logging
+import multiprocessing
 import random
+import sqlite3
 import time
 import traceback
-from datetime import datetime
+from multiprocessing.context import BaseContext
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    ClassVar,
+    Dict,
+    List,
+    Optional,
+    Set,
+    TextIO,
+    Tuple,
+    Union,
+    cast,
+    final,
+)
 
-import aiosqlite
-from blspy import AugSchemeMPL
+from gold_rs import AugSchemeMPL
+from packaging.version import Version
 
-import chia.server.ws_connection as ws  # lgtm [py/import-and-import-from]
+from chia.consensus.block_body_validation import ForkInfo
 from chia.consensus.block_creation import unfinished_block_to_full_block
 from chia.consensus.block_record import BlockRecord
-from chia.consensus.blockchain import Blockchain, ReceiveBlockResult
+from chia.consensus.blockchain import AddBlockResult, Blockchain, BlockchainMutexPriority, StateChangeSummary
 from chia.consensus.blockchain_interface import BlockchainInterface
 from chia.consensus.constants import ConsensusConstants
 from chia.consensus.cost_calculator import NPCResult
@@ -25,219 +46,440 @@ from chia.consensus.pot_iterations import calculate_sp_iters
 from chia.full_node.block_store import BlockStore
 from chia.full_node.bundle_tools import detect_potential_template_generator
 from chia.full_node.coin_store import CoinStore
-from chia.full_node.full_node_store import FullNodeStore, FullNodeStorePeakResult
+from chia.full_node.full_node_api import FullNodeAPI
+from chia.full_node.full_node_store import FullNodeStore, FullNodeStorePeakResult, UnfinishedBlockEntry
+from chia.full_node.hint_management import get_hints_and_subscription_coin_ids
 from chia.full_node.hint_store import HintStore
-from chia.full_node.lock_queue import LockClient, LockQueue
-from chia.full_node.mempool_manager import MempoolManager
+from chia.full_node.mempool import MempoolRemoveInfo
+from chia.full_node.mempool_manager import MempoolManager, NewPeakItem
 from chia.full_node.signage_point import SignagePoint
-from chia.full_node.sync_store import SyncStore
+from chia.full_node.subscriptions import PeerSubscriptions, peers_for_spend_bundle
+from chia.full_node.sync_store import Peak, SyncStore
+from chia.full_node.tx_processing_queue import TransactionQueue
 from chia.full_node.weight_proof import WeightProofHandler
 from chia.protocols import farmer_protocol, full_node_protocol, timelord_protocol, wallet_protocol
+from chia.protocols.farmer_protocol import SignagePointSourceData, SPSubSlotSourceData, SPVDFSourceData
 from chia.protocols.full_node_protocol import RequestBlocks, RespondBlock, RespondBlocks, RespondSignagePoint
 from chia.protocols.protocol_message_types import ProtocolMessageTypes
-from chia.protocols.wallet_protocol import CoinState, CoinStateUpdate
+from chia.protocols.shared_protocol import Capability
+from chia.protocols.wallet_protocol import CoinState, CoinStateUpdate, RemovedMempoolItem
+from chia.rpc.rpc_server import StateChangedProtocol
 from chia.server.node_discovery import FullNodePeers
 from chia.server.outbound_message import Message, NodeType, make_msg
-from chia.server.server import ChiaServer
+from chia.server.server import GoldServer
+from chia.server.ws_connection import WSGoldConnection
 from chia.types.blockchain_format.classgroup import ClassgroupElement
 from chia.types.blockchain_format.pool_target import PoolTarget
 from chia.types.blockchain_format.sized_bytes import bytes32
 from chia.types.blockchain_format.sub_epoch_summary import SubEpochSummary
-from chia.types.blockchain_format.vdf import CompressibleVDFField, VDFInfo, VDFProof
+from chia.types.blockchain_format.vdf import CompressibleVDFField, VDFInfo, VDFProof, validate_vdf
 from chia.types.coin_record import CoinRecord
 from chia.types.end_of_slot_bundle import EndOfSubSlotBundle
 from chia.types.full_block import FullBlock
 from chia.types.generator_types import BlockGenerator
 from chia.types.header_block import HeaderBlock
 from chia.types.mempool_inclusion_status import MempoolInclusionStatus
+from chia.types.mempool_item import MempoolItem
+from chia.types.peer_info import PeerInfo
 from chia.types.spend_bundle import SpendBundle
 from chia.types.transaction_queue_entry import TransactionQueueEntry
 from chia.types.unfinished_block import UnfinishedBlock
-from chia.util import cached_bls
+from chia.types.weight_proof import WeightProof
 from chia.util.bech32m import encode_puzzle_hash
+from chia.util.cached_bls import BLSCache
 from chia.util.check_fork_next_block import check_fork_next_block
 from chia.util.condition_tools import pkm_pairs
+from chia.util.config import process_config_start_method
 from chia.util.db_synchronous import db_synchronous_on
-from chia.util.db_wrapper import DBWrapper
-from chia.util.errors import ConsensusError, Err, ValidationError
+from chia.util.db_version import lookup_db_version, set_db_version_async
+from chia.util.db_wrapper import DBWrapper2, manage_connection
+from chia.util.errors import ConsensusError, Err, TimestampError, ValidationError
 from chia.util.ints import uint8, uint32, uint64, uint128
-from chia.util.path import mkdir, path_from_root
-from chia.util.profiler import profile_task
+from chia.util.limited_semaphore import LimitedSemaphore
+from chia.util.log_exceptions import log_exceptions
+from chia.util.path import path_from_root
+from chia.util.profiler import enable_profiler, mem_profile_task, profile_task
 from chia.util.safe_cancel_task import cancel_task_safe
 
 
+# This is the result of calling peak_post_processing, which is then fed into peak_post_processing_2
+@dataclasses.dataclass
+class PeakPostProcessingResult:
+    mempool_peak_result: List[NewPeakItem]  # The new items from calling MempoolManager.new_peak
+    mempool_removals: List[MempoolRemoveInfo]  # The removed mempool items from calling MempoolManager.new_peak
+    fns_peak_result: FullNodeStorePeakResult  # The result of calling FullNodeStore.new_peak
+    hints: List[Tuple[bytes32, bytes]]  # The hints added to the DB
+    lookup_coin_ids: List[bytes32]  # The coin IDs that we need to look up to notify wallets of changes
+
+
+@dataclasses.dataclass(frozen=True)
+class WalletUpdate:
+    fork_height: uint32
+    peak: Peak
+    coin_records: List[CoinRecord]
+    hints: Dict[bytes32, bytes32]
+
+
+@final
+@dataclasses.dataclass
 class FullNode:
-    block_store: BlockStore
-    full_node_store: FullNodeStore
-    full_node_peers: Optional[FullNodePeers]
-    sync_store: Any
-    coin_store: CoinStore
-    mempool_manager: MempoolManager
-    connection: aiosqlite.Connection
-    _sync_task: Optional[asyncio.Task]
-    _init_weight_proof: Optional[asyncio.Task] = None
-    blockchain: Blockchain
-    config: Dict
-    server: Any
-    log: logging.Logger
-    constants: ConsensusConstants
-    _shut_down: bool
+    if TYPE_CHECKING:
+        from chia.rpc.rpc_server import RpcServiceProtocol
+
+        _protocol_check: ClassVar[RpcServiceProtocol] = cast("FullNode", None)
+
     root_path: Path
-    state_changed_callback: Optional[Callable]
-    timelord_lock: asyncio.Lock
-    initialized: bool
-    weight_proof_handler: Optional[WeightProofHandler]
-    _ui_tasks: Set[asyncio.Task]
-    _blockchain_lock_queue: LockQueue
-    _blockchain_lock_ultra_priority: LockClient
-    _blockchain_lock_high_priority: LockClient
-    _blockchain_lock_low_priority: LockClient
+    config: Dict[str, Any]
+    constants: ConsensusConstants
+    signage_point_times: List[float]
+    full_node_store: FullNodeStore
+    log: logging.Logger
+    db_path: Path
+    wallet_sync_queue: asyncio.Queue[WalletUpdate]
+    _segment_task: Optional[asyncio.Task[None]] = None
+    initialized: bool = False
+    _server: Optional[GoldServer] = None
+    _shut_down: bool = False
+    pow_creation: Dict[bytes32, asyncio.Event] = dataclasses.field(default_factory=dict)
+    state_changed_callback: Optional[StateChangedProtocol] = None
+    full_node_peers: Optional[FullNodePeers] = None
+    sync_store: SyncStore = dataclasses.field(default_factory=SyncStore)
+    uncompact_task: Optional[asyncio.Task[None]] = None
+    compact_vdf_requests: Set[bytes32] = dataclasses.field(default_factory=set)
+    # TODO: Logging isn't setup yet so the log entries related to parsing the
+    #       config would end up on stdout if handled here.
+    multiprocessing_context: Optional[BaseContext] = None
+    _ui_tasks: Set[asyncio.Task[None]] = dataclasses.field(default_factory=set)
+    subscriptions: PeerSubscriptions = dataclasses.field(default_factory=PeerSubscriptions)
+    _transaction_queue_task: Optional[asyncio.Task[None]] = None
+    simulator_transaction_callback: Optional[Callable[[bytes32], Awaitable[None]]] = None
+    _sync_task: Optional[asyncio.Task[None]] = None
+    _transaction_queue: Optional[TransactionQueue] = None
+    _compact_vdf_sem: Optional[LimitedSemaphore] = None
+    _new_peak_sem: Optional[LimitedSemaphore] = None
+    _add_transaction_semaphore: Optional[asyncio.Semaphore] = None
+    _db_wrapper: Optional[DBWrapper2] = None
+    _hint_store: Optional[HintStore] = None
+    _block_store: Optional[BlockStore] = None
+    _coin_store: Optional[CoinStore] = None
+    _mempool_manager: Optional[MempoolManager] = None
+    _init_weight_proof: Optional[asyncio.Task[None]] = None
+    _blockchain: Optional[Blockchain] = None
+    _timelord_lock: Optional[asyncio.Lock] = None
+    weight_proof_handler: Optional[WeightProofHandler] = None
+    # hashes of peaks that failed long sync on chip13 Validation
+    bad_peak_cache: Dict[bytes32, uint32] = dataclasses.field(default_factory=dict)
+    wallet_sync_task: Optional[asyncio.Task[None]] = None
+    _bls_cache: BLSCache = dataclasses.field(default_factory=lambda: BLSCache(50000))
 
-    def __init__(
-        self,
-        config: Dict,
-        root_path: Path,
-        consensus_constants: ConsensusConstants,
-        name: str = None,
-    ):
-        self.initialized = False
-        self.root_path = root_path
-        self.config = config
-        self.server = None
-        self._shut_down = False  # Set to true to close all infinite loops
-        self.constants = consensus_constants
-        self.pow_creation: Dict[uint32, asyncio.Event] = {}
-        self.state_changed_callback: Optional[Callable] = None
-        self.full_node_peers = None
-        self.sync_store = None
-        self.signage_point_times = [time.time() for _ in range(self.constants.NUM_SPS_SUB_SLOT)]
-        self.full_node_store = FullNodeStore(self.constants)
-        self.uncompact_task = None
-        self.compact_vdf_requests: Set[bytes32] = set()
-        self.log = logging.getLogger(name if name else __name__)
+    @property
+    def server(self) -> GoldServer:
+        # This is a stop gap until the class usage is refactored such the values of
+        # integral attributes are known at creation of the instance.
+        if self._server is None:
+            raise RuntimeError("server not assigned")
 
-        # Used for metrics
-        self.dropped_tx: Set[bytes32] = set()
-        self.not_dropped_tx = 0
+        return self._server
 
-        self._ui_tasks = set()
-
+    @classmethod
+    async def create(
+            cls,
+            config: Dict[str, Any],
+            root_path: Path,
+            consensus_constants: ConsensusConstants,
+            name: str = __name__,
+    ) -> FullNode:
+        # NOTE: async to force the queue creation to occur when an event loop is available
         db_path_replaced: str = config["database_path"].replace("CHALLENGE", config["selected_network"])
-        self.db_path = path_from_root(root_path, db_path_replaced)
-        self.coin_subscriptions: Dict[bytes32, Set[bytes32]] = {}  # Puzzle Hash : Set[Peer ID]
-        self.ph_subscriptions: Dict[bytes32, Set[bytes32]] = {}  # Puzzle Hash : Set[Peer ID]
-        self.peer_coin_ids: Dict[bytes32, Set[bytes32]] = {}  # Peer ID: Set[Coin ids]
-        self.peer_puzzle_hash: Dict[bytes32, Set[bytes32]] = {}  # Peer ID: Set[puzzle_hash]
-        self.peer_sub_counter: Dict[bytes32, int] = {}  # Peer ID: int (subscription count)
-        mkdir(self.db_path.parent)
+        db_path = path_from_root(root_path, db_path_replaced)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    def _set_state_changed_callback(self, callback: Callable):
-        self.state_changed_callback = callback
+        return cls(
+            root_path=root_path,
+            config=config,
+            constants=consensus_constants,
+            signage_point_times=[time.time() for _ in range(consensus_constants.NUM_SPS_SUB_SLOT)],
+            full_node_store=FullNodeStore(consensus_constants),
+            log=logging.getLogger(name),
+            db_path=db_path,
+            wallet_sync_queue=asyncio.Queue(),
+        )
 
-    async def _start(self):
-        self.timelord_lock = asyncio.Lock()
-        self.compact_vdf_sem = asyncio.Semaphore(4)
+    @contextlib.asynccontextmanager
+    async def manage(self) -> AsyncIterator[None]:
+        self._timelord_lock = asyncio.Lock()
+        self._compact_vdf_sem = LimitedSemaphore.create(active_limit=4, waiting_limit=20)
 
         # We don't want to run too many concurrent new_peak instances, because it would fetch the same block from
         # multiple peers and re-validate.
-        self.new_peak_sem = asyncio.Semaphore(2)
+        self._new_peak_sem = LimitedSemaphore.create(active_limit=2, waiting_limit=20)
 
         # These many respond_transaction tasks can be active at any point in time
-        self.respond_transaction_semaphore = asyncio.Semaphore(200)
-        # create the store (db) and full node instance
-        self.connection = await aiosqlite.connect(self.db_path)
-        await self.connection.execute("pragma journal_mode=wal")
+        self._add_transaction_semaphore = asyncio.Semaphore(200)
 
-        await self.connection.execute(
-            "pragma synchronous={}".format(db_synchronous_on(self.config.get("db_sync", "auto"), self.db_path))
-        )
+        sql_log_path: Optional[Path] = None
+        with contextlib.ExitStack() as exit_stack:
+            sql_log_file: Optional[TextIO] = None
+            if self.config.get("log_sqlite_cmds", False):
+                sql_log_path = path_from_root(self.root_path, "log/sql.log")
+                self.log.info(f"logging SQL commands to {sql_log_path}")
+                sql_log_file = exit_stack.enter_context(sql_log_path.open("a", encoding="utf-8"))
 
-        if self.config.get("log_sqlite_cmds", False):
-            sql_log_path = path_from_root(self.root_path, "log/sql.log")
-            self.log.info(f"logging SQL commands to {sql_log_path}")
+            # create the store (db) and full node instance
+            # TODO: is this standardized and thus able to be handled by DBWrapper2?
+            async with manage_connection(self.db_path, log_file=sql_log_file, name="version_check") as db_connection:
+                db_version = await lookup_db_version(db_connection)
 
-            def sql_trace_callback(req: str):
-                timestamp = datetime.now().strftime("%H:%M:%S.%f")
-                log = open(sql_log_path, "a")
-                log.write(timestamp + " " + req + "\n")
-                log.close()
+        self.log.info(f"using blockchain database {self.db_path}, which is version {db_version}")
 
-            await self.connection.set_trace_callback(sql_trace_callback)
-        self.db_wrapper = DBWrapper(self.connection)
-        self.block_store = await BlockStore.create(self.db_wrapper)
-        self.sync_store = await SyncStore.create()
-        self.hint_store = await HintStore.create(self.db_wrapper)
-        self.coin_store = await CoinStore.create(self.db_wrapper)
-        self.log.info("Initializing blockchain from disk")
-        start_time = time.time()
-        self.blockchain = await Blockchain.create(self.coin_store, self.block_store, self.constants, self.hint_store)
-        self.mempool_manager = MempoolManager(self.coin_store, self.constants)
+        db_sync = db_synchronous_on(self.config.get("db_sync", "auto"))
+        self.log.info(f"opening blockchain DB: synchronous={db_sync}")
 
-        # Blocks are validated under high priority, and transactions under low priority. This guarantees blocks will
-        # be validated first.
-        self._blockchain_lock_queue = LockQueue(self.blockchain.lock)
-        self._blockchain_lock_ultra_priority = LockClient(0, self._blockchain_lock_queue)
-        self._blockchain_lock_high_priority = LockClient(1, self._blockchain_lock_queue)
-        self._blockchain_lock_low_priority = LockClient(2, self._blockchain_lock_queue)
+        async with DBWrapper2.managed(
+                self.db_path,
+                db_version=db_version,
+                reader_count=self.config.get("db_readers", 4),
+                log_path=sql_log_path,
+                synchronous=db_sync,
+        ) as self._db_wrapper:
+            if self.db_wrapper.db_version != 2:
+                async with self.db_wrapper.reader_no_transaction() as conn:
+                    async with conn.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table' AND name='full_blocks'"
+                    ) as cur:
+                        if len(list(await cur.fetchall())) == 0:
+                            try:
+                                # this is a new DB file. Make it v2
+                                async with self.db_wrapper.writer_maybe_transaction() as w_conn:
+                                    await set_db_version_async(w_conn, 2)
+                                    self.db_wrapper.db_version = 2
+                                    self.log.info("blockchain database is empty, configuring as v2")
+                            except sqlite3.OperationalError:
+                                # it could be a database created with "gold init", which is
+                                # empty except it has the database_version table
+                                pass
 
-        # Transactions go into this queue from the server, and get sent to respond_transaction
-        self.transaction_queue = asyncio.PriorityQueue(10000)
-        self._transaction_queue_task = asyncio.create_task(self._handle_transactions())
-        self.transaction_responses: List[Tuple[bytes32, MempoolInclusionStatus, Optional[Err]]] = []
-
-        self.weight_proof_handler = None
-        self._init_weight_proof = asyncio.create_task(self.initialize_weight_proof())
-
-        if self.config.get("enable_profiler", False):
-            asyncio.create_task(profile_task(self.root_path, "node", self.log))
-
-        self._sync_task = None
-        self._segment_task = None
-        time_taken = time.time() - start_time
-        if self.blockchain.get_peak() is None:
-            self.log.info(f"Initialized with empty blockchain time taken: {int(time_taken)}s")
-        else:
-            self.log.info(
-                f"Blockchain initialized to peak {self.blockchain.get_peak().header_hash} height"
-                f" {self.blockchain.get_peak().height}, "
-                f"time taken: {int(time_taken)}s"
+            self._block_store = await BlockStore.create(self.db_wrapper)
+            self._hint_store = await HintStore.create(self.db_wrapper)
+            self._coin_store = await CoinStore.create(self.db_wrapper)
+            self.log.info("Initializing blockchain from disk")
+            start_time = time.monotonic()
+            reserved_cores = self.config.get("reserved_cores", 0)
+            single_threaded = self.config.get("single_threaded", False)
+            multiprocessing_start_method = process_config_start_method(config=self.config, log=self.log)
+            self.multiprocessing_context = multiprocessing.get_context(method=multiprocessing_start_method)
+            self._blockchain = await Blockchain.create(
+                coin_store=self.coin_store,
+                block_store=self.block_store,
+                consensus_constants=self.constants,
+                blockchain_dir=self.db_path.parent,
+                reserved_cores=reserved_cores,
+                multiprocessing_context=self.multiprocessing_context,
+                single_threaded=single_threaded,
             )
-            async with self._blockchain_lock_high_priority:
-                pending_tx = await self.mempool_manager.new_peak(self.blockchain.get_peak(), [])
-            assert len(pending_tx) == 0  # no pending transactions when starting up
 
-        peak: Optional[BlockRecord] = self.blockchain.get_peak()
-        if peak is not None:
-            full_peak = await self.blockchain.get_full_peak()
-            mempool_new_peak_result, fns_peak_result = await self.peak_post_processing(
-                full_peak, peak, max(peak.height - 1, 0), None, []
+            self._mempool_manager = MempoolManager(
+                get_coin_records=self.coin_store.get_coin_records,
+                consensus_constants=self.constants,
+                multiprocessing_context=self.multiprocessing_context,
+                single_threaded=single_threaded,
             )
-            await self.peak_post_processing_2(
-                full_peak, peak, max(peak.height - 1, 0), None, ([], {}), mempool_new_peak_result, fns_peak_result
-            )
-        if self.config["send_uncompact_interval"] != 0:
-            sanitize_weight_proof_only = False
-            if "sanitize_weight_proof_only" in self.config:
-                sanitize_weight_proof_only = self.config["sanitize_weight_proof_only"]
-            assert self.config["target_uncompact_proofs"] != 0
-            self.uncompact_task = asyncio.create_task(
-                self.broadcast_uncompact_blocks(
-                    self.config["send_uncompact_interval"],
-                    self.config["target_uncompact_proofs"],
-                    sanitize_weight_proof_only,
+
+            # Transactions go into this queue from the server, and get sent to respond_transaction
+            self._transaction_queue = TransactionQueue(1000, self.log)
+            self._transaction_queue_task: asyncio.Task[None] = asyncio.create_task(self._handle_transactions())
+
+            self._init_weight_proof = asyncio.create_task(self.initialize_weight_proof())
+
+            if self.config.get("enable_profiler", False):
+                asyncio.create_task(profile_task(self.root_path, "node", self.log))
+
+            self.profile_block_validation = self.config.get("profile_block_validation", False)
+            if self.profile_block_validation:  # pragma: no cover
+                # this is not covered by any unit tests as it's essentially test code
+                # itself. It's exercised manually when investigating performance issues
+                profile_dir = path_from_root(self.root_path, "block-validation-profile")
+                profile_dir.mkdir(parents=True, exist_ok=True)
+
+            if self.config.get("enable_memory_profiler", False):
+                asyncio.create_task(mem_profile_task(self.root_path, "node", self.log))
+
+            time_taken = time.monotonic() - start_time
+            peak: Optional[BlockRecord] = self.blockchain.get_peak()
+            if peak is None:
+                self.log.info(f"Initialized with empty blockchain time taken: {int(time_taken)}s")
+                num_unspent = await self.coin_store.num_unspent()
+                if num_unspent > 0:
+                    self.log.error(
+                        f"Inconsistent blockchain DB file! Could not find peak block but found {num_unspent} coins! "
+                        "This is a fatal error. The blockchain database may be corrupt"
+                    )
+                    raise RuntimeError("corrupt blockchain DB")
+            else:
+                self.log.info(
+                    f"Blockchain initialized to peak {peak.header_hash} height"
+                    f" {peak.height}, "
+                    f"time taken: {int(time_taken)}s"
                 )
-            )
-        self.initialized = True
-        if self.full_node_peers is not None:
-            asyncio.create_task(self.full_node_peers.start())
+                async with self.blockchain.priority_mutex.acquire(priority=BlockchainMutexPriority.high):
+                    pending_tx = await self.mempool_manager.new_peak(self.blockchain.get_tx_peak(), None)
+                assert len(pending_tx.items) == 0  # no pending transactions when starting up
 
-    async def _handle_one_transaction(self, entry: TransactionQueueEntry):
+                full_peak: Optional[FullBlock] = await self.blockchain.get_full_peak()
+                assert full_peak is not None
+                state_change_summary = StateChangeSummary(peak, uint32(max(peak.height - 1, 0)), [], [], [], [])
+                ppp_result: PeakPostProcessingResult = await self.peak_post_processing(
+                    full_peak, state_change_summary, None
+                )
+                await self.peak_post_processing_2(full_peak, None, state_change_summary, ppp_result)
+            if self.config["send_uncompact_interval"] != 0:
+                sanitize_weight_proof_only = False
+                if "sanitize_weight_proof_only" in self.config:
+                    sanitize_weight_proof_only = self.config["sanitize_weight_proof_only"]
+                assert self.config["target_uncompact_proofs"] != 0
+                self.uncompact_task = asyncio.create_task(
+                    self.broadcast_uncompact_blocks(
+                        self.config["send_uncompact_interval"],
+                        self.config["target_uncompact_proofs"],
+                        sanitize_weight_proof_only,
+                    )
+                )
+            if self.wallet_sync_task is None or self.wallet_sync_task.done():
+                self.wallet_sync_task = asyncio.create_task(self._wallets_sync_task_handler())
+
+            self.initialized = True
+            if self.full_node_peers is not None:
+                asyncio.create_task(self.full_node_peers.start())
+            try:
+                yield
+            finally:
+                self._shut_down = True
+                if self._init_weight_proof is not None:
+                    self._init_weight_proof.cancel()
+
+                # blockchain is created in _start and in certain cases it may not exist here during _close
+                if self._blockchain is not None:
+                    self.blockchain.shut_down()
+                # same for mempool_manager
+                if self._mempool_manager is not None:
+                    self.mempool_manager.shut_down()
+
+                if self.full_node_peers is not None:
+                    asyncio.create_task(self.full_node_peers.close())
+                if self.uncompact_task is not None:
+                    self.uncompact_task.cancel()
+                if self._transaction_queue_task is not None:
+                    self._transaction_queue_task.cancel()
+                cancel_task_safe(task=self.wallet_sync_task, log=self.log)
+                cancel_task_safe(task=self._sync_task, log=self.log)
+
+                for task_id, task in list(self.full_node_store.tx_fetch_tasks.items()):
+                    cancel_task_safe(task, self.log)
+                if self._init_weight_proof is not None:
+                    await asyncio.wait([self._init_weight_proof])
+                if self._sync_task is not None:
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await self._sync_task
+
+    @property
+    def block_store(self) -> BlockStore:
+        assert self._block_store is not None
+        return self._block_store
+
+    @property
+    def timelord_lock(self) -> asyncio.Lock:
+        assert self._timelord_lock is not None
+        return self._timelord_lock
+
+    @property
+    def mempool_manager(self) -> MempoolManager:
+        assert self._mempool_manager is not None
+        return self._mempool_manager
+
+    @property
+    def blockchain(self) -> Blockchain:
+        assert self._blockchain is not None
+        return self._blockchain
+
+    @property
+    def coin_store(self) -> CoinStore:
+        assert self._coin_store is not None
+        return self._coin_store
+
+    @property
+    def add_transaction_semaphore(self) -> asyncio.Semaphore:
+        assert self._add_transaction_semaphore is not None
+        return self._add_transaction_semaphore
+
+    @property
+    def transaction_queue(self) -> TransactionQueue:
+        assert self._transaction_queue is not None
+        return self._transaction_queue
+
+    @property
+    def db_wrapper(self) -> DBWrapper2:
+        assert self._db_wrapper is not None
+        return self._db_wrapper
+
+    @property
+    def hint_store(self) -> HintStore:
+        assert self._hint_store is not None
+        return self._hint_store
+
+    @property
+    def new_peak_sem(self) -> LimitedSemaphore:
+        assert self._new_peak_sem is not None
+        return self._new_peak_sem
+
+    @property
+    def compact_vdf_sem(self) -> LimitedSemaphore:
+        assert self._compact_vdf_sem is not None
+        return self._compact_vdf_sem
+
+    def get_connections(self, request_node_type: Optional[NodeType]) -> List[Dict[str, Any]]:
+        connections = self.server.get_connections(request_node_type)
+        con_info: List[Dict[str, Any]] = []
+        if self.sync_store is not None:
+            peak_store = self.sync_store.peer_to_peak
+        else:
+            peak_store = None
+        for con in connections:
+            if peak_store is not None and con.peer_node_id in peak_store:
+                peak = peak_store[con.peer_node_id]
+                peak_height = peak.height
+                peak_hash = peak.header_hash
+                peak_weight = peak.weight
+            else:
+                peak_height = None
+                peak_hash = None
+                peak_weight = None
+            con_dict: Dict[str, Any] = {
+                "type": con.connection_type,
+                "local_port": con.local_port,
+                "peer_host": con.peer_info.host,
+                "peer_port": con.peer_info.port,
+                "peer_server_port": con.peer_server_port,
+                "node_id": con.peer_node_id,
+                "creation_time": con.creation_time,
+                "bytes_read": con.bytes_read,
+                "bytes_written": con.bytes_written,
+                "last_message_time": con.last_message_time,
+                "peak_height": peak_height,
+                "peak_weight": peak_weight,
+                "peak_hash": peak_hash,
+            }
+            con_info.append(con_dict)
+
+        return con_info
+
+    def _set_state_changed_callback(self, callback: StateChangedProtocol) -> None:
+        self.state_changed_callback = callback
+
+    async def _handle_one_transaction(self, entry: TransactionQueueEntry) -> None:
         peer = entry.peer
         try:
-            inc_status, err = await self.respond_transaction(entry.transaction, entry.spend_name, peer, entry.test)
-            self.transaction_responses.append((entry.spend_name, inc_status, err))
-            if len(self.transaction_responses) > 50:
-                self.transaction_responses = self.transaction_responses[1:]
+            inc_status, err = await self.add_transaction(entry.transaction, entry.spend_name, peer, entry.test)
+            entry.done.set((inc_status, err))
         except asyncio.CancelledError:
             error_stack = traceback.format_exc()
             self.log.debug(f"Cancelling _handle_one_transaction, closing: {error_stack}")
@@ -247,47 +489,45 @@ class FullNode:
             if peer is not None:
                 await peer.close()
         finally:
-            self.respond_transaction_semaphore.release()
+            self.add_transaction_semaphore.release()
 
-    async def _handle_transactions(self):
-        try:
-            while not self._shut_down:
-                # We use a semaphore to make sure we don't send more than 200 concurrent calls of respond_transaction.
-                # However doing them one at a time would be slow, because they get sent to other processes.
-                await self.respond_transaction_semaphore.acquire()
-                item: TransactionQueueEntry = (await self.transaction_queue.get())[1]
-                asyncio.create_task(self._handle_one_transaction(item))
-        except asyncio.CancelledError:
-            raise
+    async def _handle_transactions(self) -> None:
+        while not self._shut_down:
+            # We use a semaphore to make sure we don't send more than 200 concurrent calls of respond_transaction.
+            # However, doing them one at a time would be slow, because they get sent to other processes.
+            await self.add_transaction_semaphore.acquire()
+            item: TransactionQueueEntry = await self.transaction_queue.pop()
+            asyncio.create_task(self._handle_one_transaction(item))
 
-    async def initialize_weight_proof(self):
-        self.weight_proof_handler = WeightProofHandler(self.constants, self.blockchain)
+    async def initialize_weight_proof(self) -> None:
+        self.weight_proof_handler = WeightProofHandler(
+            constants=self.constants,
+            blockchain=self.blockchain,
+            multiprocessing_context=self.multiprocessing_context,
+        )
         peak = self.blockchain.get_peak()
         if peak is not None:
             await self.weight_proof_handler.create_sub_epoch_segments()
 
-    def set_server(self, server: ChiaServer):
-        self.server = server
-        dns_servers = []
+    def set_server(self, server: GoldServer) -> None:
+        self._server = server
+        dns_servers: List[str] = []
+        network_name = self.config["selected_network"]
         try:
-            network_name = self.config["selected_network"]
             default_port = self.config["network_overrides"]["config"][network_name]["default_full_node_port"]
         except Exception:
             self.log.info("Default port field not found in config.")
             default_port = None
         if "dns_servers" in self.config:
             dns_servers = self.config["dns_servers"]
-        elif self.config["port"] == 8444:
-            # If `dns_servers` misses from the `config`, hardcode it if we're running mainnet.
-            # dns_servers.append("dns-introducer.chia.net")
-            pass
+        elif network_name == "mainnet":
+            # If `dns_servers` is missing from the `config`, hardcode it if we're running mainnet.
+            dns_servers.append("dns-introducer.glcoin.net")
         try:
             self.full_node_peers = FullNodePeers(
                 self.server,
-                self.root_path,
-                self.config["target_peer_count"] - self.config["target_outbound_peer_count"],
                 self.config["target_outbound_peer_count"],
-                self.config["peer_db_path"],
+                self.root_path / Path(self.config.get("peers_file_path", "db/peers.dat")),
                 self.config["introducer_peer"],
                 dns_servers,
                 self.config["peer_connect_interval"],
@@ -301,11 +541,11 @@ class FullNode:
             self.log.error(f"Exception in peer discovery: {e}")
             self.log.error(f"Exception Stack: {error_stack}")
 
-    def _state_changed(self, change: str):
+    def _state_changed(self, change: str, change_data: Optional[Dict[str, Any]] = None) -> None:
         if self.state_changed_callback is not None:
-            self.state_changed_callback(change)
+            self.state_changed_callback(change, change_data)
 
-    async def short_sync_batch(self, peer: ws.WSChiaConnection, start_height: uint32, target_height: uint32) -> bool:
+    async def short_sync_batch(self, peer: WSGoldConnection, start_height: uint32, target_height: uint32) -> bool:
         """
         Tries to sync to a chain which is not too far in the future, by downloading batches of blocks. If the first
         block that we download is not connected to our chain, we return False and do an expensive long sync instead.
@@ -322,10 +562,7 @@ class FullNode:
         """
         # Don't trigger multiple batch syncs to the same peer
 
-        if (
-            peer.peer_node_id in self.sync_store.backtrack_syncing
-            and self.sync_store.backtrack_syncing[peer.peer_node_id] > 0
-        ):
+        if self.sync_store.is_backtrack_syncing(node_id=peer.peer_node_id):
             return True  # Don't batch sync, we are already in progress of a backtrack sync
         if peer.peer_node_id in self.sync_store.batch_syncing:
             return True  # Don't trigger a long sync
@@ -333,10 +570,13 @@ class FullNode:
 
         self.log.info(f"Starting batch short sync from {start_height} to height {target_height}")
         if start_height > 0:
-            first = await peer.request_block(full_node_protocol.RequestBlock(uint32(start_height), False))
+            first = await peer.call_api(
+                FullNodeAPI.request_block, full_node_protocol.RequestBlock(uint32(start_height), False)
+            )
             if first is None or not isinstance(first, full_node_protocol.RespondBlock):
                 self.sync_store.batch_syncing.remove(peer.peer_node_id)
-                raise ValueError(f"Error short batch syncing, could not fetch block at height {start_height}")
+                self.log.error(f"Error short batch syncing, could not fetch block at height {start_height}")
+                return False
             if not self.blockchain.contains_block(first.block.prev_header_hash):
                 self.log.info("Batch syncing stopped, this is a deep chain")
                 self.sync_store.batch_syncing.remove(peer.peer_node_id)
@@ -352,55 +592,48 @@ class FullNode:
             self._segment_task = None
 
         try:
+            peer_info = peer.get_peer_logging()
+            self.sync_store.set_sync_mode(True)
             for height in range(start_height, target_height, batch_size):
                 end_height = min(target_height, height + batch_size)
                 request = RequestBlocks(uint32(height), uint32(end_height), True)
-                response = await peer.request_blocks(request)
+                response = await peer.call_api(FullNodeAPI.request_blocks, request)
                 if not response:
                     raise ValueError(f"Error short batch syncing, invalid/no response for {height}-{end_height}")
-                async with self._blockchain_lock_high_priority:
-                    for block in response.blocks:
-                        success, advanced_peak, fork_height, coin_changes = await self.receive_block_batch(
-                            [block], peer, None
-                        )
-                        if not success:
-                            raise ValueError(
-                                f"Error short batch syncing, failed to validate blocks {height}-{end_height}"
+                async with self.blockchain.priority_mutex.acquire(priority=BlockchainMutexPriority.high):
+                    state_change_summary: Optional[StateChangeSummary]
+                    success, state_change_summary, _ = await self.add_block_batch(response.blocks, peer_info, None)
+                    if not success:
+                        raise ValueError(f"Error short batch syncing, failed to validate blocks {height}-{end_height}")
+                    if state_change_summary is not None:
+                        try:
+                            peak_fb: Optional[FullBlock] = await self.blockchain.get_full_peak()
+                            assert peak_fb is not None
+                            ppp_result: PeakPostProcessingResult = await self.peak_post_processing(
+                                peak_fb,
+                                state_change_summary,
+                                peer,
                             )
-                        if advanced_peak:
-                            peak = self.blockchain.get_peak()
-                            try:
-                                peak_fb: Optional[FullBlock] = await self.blockchain.get_full_peak()
-                                assert peak is not None and peak_fb is not None and fork_height is not None
-                                mempool_new_peak_result, fns_peak_result = await self.peak_post_processing(
-                                    peak_fb, peak, fork_height, peer, coin_changes[0]
-                                )
-                                await self.peak_post_processing_2(
-                                    peak_fb,
-                                    peak,
-                                    fork_height,
-                                    peer,
-                                    coin_changes,
-                                    mempool_new_peak_result,
-                                    fns_peak_result,
-                                )
-                            except asyncio.CancelledError:
-                                # Still do post processing after cancel
-                                peak_fb = await self.blockchain.get_full_peak()
-                                assert peak is not None and peak_fb is not None and fork_height is not None
-                                await self.peak_post_processing(peak_fb, peak, fork_height, peer, coin_changes[0])
-                                raise
-                            finally:
-                                self.log.info(f"Added blocks {height}-{end_height}")
-        except (asyncio.CancelledError, Exception) as e:
+                            await self.peak_post_processing_2(peak_fb, peer, state_change_summary, ppp_result)
+                        except Exception:
+                            # Still do post processing after cancel (or exception)
+                            peak_fb = await self.blockchain.get_full_peak()
+                            assert peak_fb is not None
+                            await self.peak_post_processing(peak_fb, state_change_summary, peer)
+                            raise
+                        finally:
+                            self.log.info(f"Added blocks {height}-{end_height}")
+        except (asyncio.CancelledError, Exception):
             self.sync_store.batch_syncing.remove(peer.peer_node_id)
-            raise e
+            self.sync_store.set_sync_mode(False)
+            raise
         self.sync_store.batch_syncing.remove(peer.peer_node_id)
+        self.sync_store.set_sync_mode(False)
         return True
 
     async def short_sync_backtrack(
-        self, peer: ws.WSChiaConnection, peak_height: uint32, target_height: uint32, target_unf_hash: bytes32
-    ):
+            self, peer: WSGoldConnection, peak_height: uint32, target_height: uint32, target_unf_hash: bytes32
+    ) -> bool:
         """
         Performs a backtrack sync, where blocks are downloaded one at a time from newest to oldest. If we do not
         find the fork point 5 deeper than our peak, we return False and do a long sync instead.
@@ -415,47 +648,49 @@ class FullNode:
             True iff we found the fork point, and we do not need to long sync.
         """
         try:
-            if peer.peer_node_id not in self.sync_store.backtrack_syncing:
-                self.sync_store.backtrack_syncing[peer.peer_node_id] = 0
-            self.sync_store.backtrack_syncing[peer.peer_node_id] += 1
+            self.sync_store.increment_backtrack_syncing(node_id=peer.peer_node_id)
 
             unfinished_block: Optional[UnfinishedBlock] = self.full_node_store.get_unfinished_block(target_unf_hash)
             curr_height: int = target_height
             found_fork_point = False
-            responses = []
+            blocks = []
             while curr_height > peak_height - 5:
                 # If we already have the unfinished block, don't fetch the transactions. In the normal case, we will
                 # already have the unfinished block, from when it was broadcast, so we just need to download the header,
                 # but not the transactions
                 fetch_tx: bool = unfinished_block is None or curr_height != target_height
-                curr = await peer.request_block(full_node_protocol.RequestBlock(uint32(curr_height), fetch_tx))
+                curr = await peer.call_api(
+                    FullNodeAPI.request_block, full_node_protocol.RequestBlock(uint32(curr_height), fetch_tx)
+                )
                 if curr is None:
                     raise ValueError(f"Failed to fetch block {curr_height} from {peer.get_peer_logging()}, timed out")
                 if curr is None or not isinstance(curr, full_node_protocol.RespondBlock):
                     raise ValueError(
                         f"Failed to fetch block {curr_height} from {peer.get_peer_logging()}, wrong type {type(curr)}"
                     )
-                responses.append(curr)
+                blocks.append(curr.block)
                 if self.blockchain.contains_block(curr.block.prev_header_hash) or curr_height == 0:
                     found_fork_point = True
                     break
                 curr_height -= 1
             if found_fork_point:
-                for response in reversed(responses):
-                    await self.respond_block(response, peer)
-        except (asyncio.CancelledError, Exception) as e:
-            self.sync_store.backtrack_syncing[peer.peer_node_id] -= 1
-            raise e
+                for block in reversed(blocks):
+                    # when syncing, we won't share any signatures with the
+                    # mempool, so there's no need to pass in the BLS cache.
+                    await self.add_block(block, peer)
+        except (asyncio.CancelledError, Exception):
+            self.sync_store.decrement_backtrack_syncing(node_id=peer.peer_node_id)
+            raise
 
-        self.sync_store.backtrack_syncing[peer.peer_node_id] -= 1
+        self.sync_store.decrement_backtrack_syncing(node_id=peer.peer_node_id)
         return found_fork_point
 
-    async def _refresh_ui_connections(self, sleep_before: float = 0):
+    async def _refresh_ui_connections(self, sleep_before: float = 0) -> None:
         if sleep_before > 0:
             await asyncio.sleep(sleep_before)
         self._state_changed("peer_changed_peak")
 
-    async def new_peak(self, request: full_node_protocol.NewPeak, peer: ws.WSChiaConnection):
+    async def new_peak(self, request: full_node_protocol.NewPeak, peer: WSGoldConnection) -> None:
         """
         We have received a notification of a new peak from a peer. This happens either when we have just connected,
         or when the peer has updated their peak.
@@ -491,28 +726,32 @@ class FullNode:
 
         if self.sync_store.get_sync_mode():
             # If peer connects while we are syncing, check if they have the block we are syncing towards
-            peak_sync_hash = self.sync_store.get_sync_target_hash()
-            peak_sync_height = self.sync_store.get_sync_target_height()
-            if peak_sync_hash is not None and request.header_hash != peak_sync_hash and peak_sync_height is not None:
-                peak_peers: Set[bytes32] = self.sync_store.get_peers_that_have_peak([peak_sync_hash])
+            target_peak = self.sync_store.target_peak
+            if target_peak is not None and request.header_hash != target_peak.header_hash:
+                peak_peers: Set[bytes32] = self.sync_store.get_peers_that_have_peak([target_peak.header_hash])
                 # Don't ask if we already know this peer has the peak
                 if peer.peer_node_id not in peak_peers:
-                    target_peak_response: Optional[RespondBlock] = await peer.request_block(
-                        full_node_protocol.RequestBlock(uint32(peak_sync_height), False), timeout=10
+                    target_peak_response: Optional[RespondBlock] = await peer.call_api(
+                        FullNodeAPI.request_block,
+                        full_node_protocol.RequestBlock(target_peak.height, False),
+                        timeout=10,
                     )
                     if target_peak_response is not None and isinstance(target_peak_response, RespondBlock):
                         self.sync_store.peer_has_block(
-                            peak_sync_hash,
+                            target_peak.header_hash,
                             peer.peer_node_id,
                             target_peak_response.block.weight,
-                            peak_sync_height,
+                            target_peak.height,
                             False,
                         )
         else:
-            if request.height <= curr_peak_height + self.config["short_sync_blocks_behind_threshold"]:
+            if (
+                    curr_peak_height <= request.height
+                    and request.height <= curr_peak_height + self.config["short_sync_blocks_behind_threshold"]
+            ):
                 # This is the normal case of receiving the next block
                 if await self.short_sync_backtrack(
-                    peer, curr_peak_height, request.height, request.unfinished_reward_block_hash
+                        peer, curr_peak_height, request.height, request.unfinished_reward_block_hash
                 ):
                     return None
 
@@ -522,9 +761,13 @@ class FullNode:
                 await self.short_sync_batch(peer, uint32(0), request.height)
                 return None
 
-            if request.height < curr_peak_height + self.config["sync_blocks_behind_threshold"]:
+            if (
+                    curr_peak_height <= request.height
+                    and request.height < curr_peak_height + self.config["sync_blocks_behind_threshold"]
+            ):
                 # This case of being behind but not by so much
-                if await self.short_sync_batch(peer, uint32(max(curr_peak_height - 128, 0)), request.height):
+                self.sync_store.target_peak = Peak(request.header_hash, request.height, request.weight)
+                if await self.short_sync_batch(peer, uint32(max(curr_peak_height - 6, 0)), request.height):
                     return None
 
             # This is the either the case where we were not able to sync successfully (for example, due to the fork
@@ -532,8 +775,8 @@ class FullNode:
             self._sync_task = asyncio.create_task(self._sync())
 
     async def send_peak_to_timelords(
-        self, peak_block: Optional[FullBlock] = None, peer: Optional[ws.WSChiaConnection] = None
-    ):
+            self, peak_block: Optional[FullBlock] = None, peer: Optional[WSGoldConnection] = None
+    ) -> None:
         """
         Sends current peak to timelords
         """
@@ -541,7 +784,6 @@ class FullNode:
             peak_block = await self.blockchain.get_full_peak()
         if peak_block is not None:
             peak = self.blockchain.block_record(peak_block.header_hash)
-            self.log.info(f"send_peak_to_timelords {peak.height} {peak.required_iters}")
             difficulty = self.blockchain.get_next_difficulty(peak.header_hash, False)
             difficulty_coeff = await self.blockchain.get_farmer_difficulty_coeff(
                 peak.farmer_public_key, peak.height - 1 if peak.height > 0 else 0
@@ -591,7 +833,11 @@ class FullNode:
             else:
                 await self.server.send_to_specific([msg], peer.peer_node_id)
 
-    async def synced(self) -> bool:
+    async def synced(self, block_is_current_at: Optional[uint64] = None) -> bool:
+        if block_is_current_at is None:
+            block_is_current_at = uint64(int(time.time() - 60 * 7))
+        if "simulator" in str(self.config.get("selected_network")):
+            return True  # sim is always synced because it has no peers
         curr: Optional[BlockRecord] = self.blockchain.get_peak()
         if curr is None:
             return False
@@ -599,18 +845,17 @@ class FullNode:
         while curr is not None and not curr.is_transaction_block:
             curr = self.blockchain.try_block_record(curr.prev_hash)
 
-        now = time.time()
         if (
-            curr is None
-            or curr.timestamp is None
-            or curr.timestamp < uint64(int(now - 60 * 7))
-            or self.sync_store.get_sync_mode()
+                curr is None
+                or curr.timestamp is None
+                or curr.timestamp < block_is_current_at
+                or self.sync_store.get_sync_mode()
         ):
             return False
         else:
             return True
 
-    async def on_connect(self, connection: ws.WSChiaConnection):
+    async def on_connect(self, connection: WSGoldConnection) -> None:
         """
         Whenever we connect to another node / wallet, send them our current heads. Also send heads to farmers
         and challenges to timelords.
@@ -661,69 +906,16 @@ class FullNode:
             elif connection.connection_type is NodeType.TIMELORD:
                 await self.send_peak_to_timelords()
 
-    def on_disconnect(self, connection: ws.WSChiaConnection):
+    async def on_disconnect(self, connection: WSGoldConnection) -> None:
         self.log.info(f"peer disconnected {connection.get_peer_logging()}")
         self._state_changed("close_connection")
         self._state_changed("sync_mode")
         if self.sync_store is not None:
             self.sync_store.peer_disconnected(connection.peer_node_id)
-        self.remove_subscriptions(connection)
-
-    def remove_subscriptions(self, peer: ws.WSChiaConnection):
         # Remove all ph | coin id subscription for this peer
-        node_id = peer.peer_node_id
-        if node_id in self.peer_puzzle_hash:
-            puzzle_hashes = self.peer_puzzle_hash[node_id]
-            for ph in puzzle_hashes:
-                if ph in self.ph_subscriptions:
-                    if node_id in self.ph_subscriptions[ph]:
-                        self.ph_subscriptions[ph].remove(node_id)
+        self.subscriptions.remove_peer(connection.peer_node_id)
 
-        if node_id in self.peer_coin_ids:
-            coin_ids = self.peer_coin_ids[node_id]
-            for coin_id in coin_ids:
-                if coin_id in self.coin_subscriptions:
-                    if node_id in self.coin_subscriptions[coin_id]:
-                        self.coin_subscriptions[coin_id].remove(node_id)
-
-        if peer.peer_node_id in self.peer_sub_counter:
-            self.peer_sub_counter.pop(peer.peer_node_id)
-
-    def _num_needed_peers(self) -> int:
-        assert self.server is not None
-        assert self.server.all_connections is not None
-        diff = self.config["target_peer_count"] - len(self.server.all_connections)
-        return diff if diff >= 0 else 0
-
-    def _close(self):
-        self._shut_down = True
-        if self._init_weight_proof is not None:
-            self._init_weight_proof.cancel()
-
-        # blockchain is created in _start and in certain cases it may not exist here during _close
-        if hasattr(self, "blockchain"):
-            self.blockchain.shut_down()
-        # same for mempool_manager
-        if hasattr(self, "mempool_manager"):
-            self.mempool_manager.shut_down()
-
-        if self.full_node_peers is not None:
-            asyncio.create_task(self.full_node_peers.close())
-        if self.uncompact_task is not None:
-            self.uncompact_task.cancel()
-        self._transaction_queue_task.cancel()
-        self._blockchain_lock_queue.close()
-
-    async def _await_closed(self):
-        cancel_task_safe(self._sync_task, self.log)
-        for task_id, task in list(self.full_node_store.tx_fetch_tasks.items()):
-            cancel_task_safe(task, self.log)
-        await self.connection.close()
-        if self._init_weight_proof is not None:
-            await asyncio.wait([self._init_weight_proof])
-        await self._blockchain_lock_queue.await_closed()
-
-    async def _sync(self):
+    async def _sync(self) -> None:
         """
         Performs a full sync of the blockchain up to the peak.
             - Wait a few seconds for peers to send us their peaks
@@ -733,8 +925,6 @@ class FullNode:
             - Download blocks in batch (and in parallel) and verify them one at a time
             - Disconnect peers that provide invalid blocks or don't have the blocks
         """
-        if self.weight_proof_handler is None:
-            return None
         # Ensure we are only syncing once and not double calling this method
         if self.sync_store.get_sync_mode():
             return None
@@ -747,19 +937,22 @@ class FullNode:
         self.log.debug("long sync started")
         try:
             self.log.info("Starting to perform sync.")
-            self.log.info("Waiting to receive peaks from peers.")
 
             # Wait until we have 3 peaks or up to a max of 30 seconds
+            max_iterations = int(self.config.get("max_sync_wait", 30)) * 10
+
+            self.log.info(f"Waiting to receive peaks from peers. (timeout: {max_iterations / 10}s)")
             peaks = []
-            for i in range(300):
-                peaks = [tup[0] for tup in self.sync_store.get_peak_of_each_peer().values()]
+            for i in range(max_iterations):
+                peaks = [peak.header_hash for peak in self.sync_store.get_peak_of_each_peer().values()]
                 if len(self.sync_store.get_peers_that_have_peak(peaks)) < 3:
                     if self._shut_down:
                         return None
                     await asyncio.sleep(0.1)
+                    continue
+                break
 
             self.log.info(f"Collected a total of {len(peaks)} peaks.")
-            self.sync_peers_handler = None
 
             # Based on responses from peers about the current peaks, see which peak is the heaviest
             # (similar to longest chain rule).
@@ -767,85 +960,35 @@ class FullNode:
 
             if target_peak is None:
                 raise RuntimeError("Not performing sync, no peaks collected")
-            heaviest_peak_hash, heaviest_peak_height, heaviest_peak_weight = target_peak
-            self.sync_store.set_peak_target(heaviest_peak_hash, heaviest_peak_height)
 
-            self.log.info(f"Selected peak {heaviest_peak_height}, {heaviest_peak_hash}")
+            self.sync_store.target_peak = target_peak
+
+            self.log.info(f"Selected peak {target_peak}")
             # Check which peers are updated to this height
 
-            peers = []
+            peers = self.server.get_connections(NodeType.FULL_NODE)
             coroutines = []
-            for peer in self.server.all_connections.values():
-                if peer.connection_type == NodeType.FULL_NODE:
-                    peers.append(peer.peer_node_id)
-                    coroutines.append(
-                        peer.request_block(
-                            full_node_protocol.RequestBlock(uint32(heaviest_peak_height), True), timeout=10
-                        )
+            for peer in peers:
+                coroutines.append(
+                    peer.call_api(
+                        FullNodeAPI.request_block,
+                        full_node_protocol.RequestBlock(target_peak.height, True),
+                        timeout=10,
                     )
+                )
             for i, target_peak_response in enumerate(await asyncio.gather(*coroutines)):
                 if target_peak_response is not None and isinstance(target_peak_response, RespondBlock):
                     self.sync_store.peer_has_block(
-                        heaviest_peak_hash, peers[i], heaviest_peak_weight, heaviest_peak_height, False
+                        target_peak.header_hash, peers[i].peer_node_id, target_peak.weight, target_peak.height, False
                     )
             # TODO: disconnect from peer which gave us the heaviest_peak, if nobody has the peak
-
-            peer_ids: Set[bytes32] = self.sync_store.get_peers_that_have_peak([heaviest_peak_hash])
-            peers_with_peak: List = [c for c in self.server.all_connections.values() if c.peer_node_id in peer_ids]
-
-            # Request weight proof from a random peer
-            self.log.info(f"Total of {len(peers_with_peak)} peers with peak {heaviest_peak_height}")
-            weight_proof_peer = random.choice(peers_with_peak)
-            self.log.info(
-                f"Requesting weight proof from peer {weight_proof_peer.peer_host} up to height"
-                f" {heaviest_peak_height}"
+            fork_point, summaries = await self.request_validate_wp(
+                target_peak.header_hash, target_peak.height, target_peak.weight
             )
-
-            if self.blockchain.get_peak() is not None and heaviest_peak_weight <= self.blockchain.get_peak().weight:
-                raise ValueError("Not performing sync, already caught up.")
-
-            wp_timeout = 360
-            if "weight_proof_timeout" in self.config:
-                wp_timeout = self.config["weight_proof_timeout"]
-            self.log.debug(f"weight proof timeout is {wp_timeout} sec")
-            request = full_node_protocol.RequestProofOfWeight(heaviest_peak_height, heaviest_peak_hash)
-            response = await weight_proof_peer.request_proof_of_weight(request, timeout=wp_timeout)
-
-            # Disconnect from this peer, because they have not behaved properly
-            if response is None or not isinstance(response, full_node_protocol.RespondProofOfWeight):
-                await weight_proof_peer.close(600)
-                raise RuntimeError(f"Weight proof did not arrive in time from peer: {weight_proof_peer.peer_host}")
-            if response.wp.recent_chain_data[-1].reward_chain_block.height != heaviest_peak_height:
-                await weight_proof_peer.close(600)
-                raise RuntimeError(f"Weight proof had the wrong height: {weight_proof_peer.peer_host}")
-            if response.wp.recent_chain_data[-1].reward_chain_block.weight != heaviest_peak_weight:
-                await weight_proof_peer.close(600)
-                raise RuntimeError(f"Weight proof had the wrong weight: {weight_proof_peer.peer_host}")
-
-            # dont sync to wp if local peak is heavier,
-            # dont ban peer, we asked for this peak
-            current_peak = self.blockchain.get_peak()
-            if current_peak is not None:
-                if response.wp.recent_chain_data[-1].reward_chain_block.weight <= current_peak.weight:
-                    raise RuntimeError(f"current peak is heavier than Weight proof peek: {weight_proof_peer.peer_host}")
-
-            try:
-                validated, fork_point, summaries = await self.weight_proof_handler.validate_weight_proof(response.wp)
-            except Exception as e:
-                await weight_proof_peer.close(600)
-                raise ValueError(f"Weight proof validation threw an error {e}")
-
-            if not validated:
-                await weight_proof_peer.close(600)
-                raise ValueError("Weight proof validation failed")
-
-            self.log.info(f"Re-checked peers: total of {len(peers_with_peak)} peers with peak {heaviest_peak_height}")
-            self.sync_store.set_sync_mode(True)
-            self._state_changed("sync_mode")
             # Ensures that the fork point does not change
-            async with self._blockchain_lock_high_priority:
+            async with self.blockchain.priority_mutex.acquire(priority=BlockchainMutexPriority.high):
                 await self.blockchain.warmup(fork_point)
-                await self.sync_from_fork_point(fork_point, heaviest_peak_height, heaviest_peak_hash, summaries)
+                await self.sync_from_fork_point(fork_point, target_peak.height, target_peak.header_hash, summaries)
         except asyncio.CancelledError:
             self.log.warning("Syncing failed, CancelledError")
         except Exception as e:
@@ -856,45 +999,107 @@ class FullNode:
                 return None
             await self._finish_sync()
 
+    async def request_validate_wp(
+            self, peak_header_hash: bytes32, peak_height: uint32, peak_weight: uint128
+    ) -> Tuple[uint32, List[SubEpochSummary]]:
+        if self.weight_proof_handler is None:
+            raise RuntimeError("Weight proof handler is None")
+        peers_with_peak = self.get_peers_with_peak(peak_header_hash)
+        # Request weight proof from a random peer
+        self.log.info(f"Total of {len(peers_with_peak)} peers with peak {peak_height}")
+        weight_proof_peer: WSGoldConnection = random.choice(peers_with_peak)
+        self.log.info(
+            f"Requesting weight proof from peer {weight_proof_peer.peer_info.host} up to height {peak_height}"
+        )
+        cur_peak: Optional[BlockRecord] = self.blockchain.get_peak()
+        if cur_peak is not None and peak_weight <= cur_peak.weight:
+            raise ValueError("Not performing sync, already caught up.")
+        wp_timeout = 360
+        if "weight_proof_timeout" in self.config:
+            wp_timeout = self.config["weight_proof_timeout"]
+        self.log.debug(f"weight proof timeout is {wp_timeout} sec")
+        request = full_node_protocol.RequestProofOfWeight(peak_height, peak_header_hash)
+        response = await weight_proof_peer.call_api(FullNodeAPI.request_proof_of_weight, request, timeout=wp_timeout)
+        # Disconnect from this peer, because they have not behaved properly
+        if response is None or not isinstance(response, full_node_protocol.RespondProofOfWeight):
+            await weight_proof_peer.close(600)
+            raise RuntimeError(f"Weight proof did not arrive in time from peer: {weight_proof_peer.peer_info.host}")
+        if response.wp.recent_chain_data[-1].reward_chain_block.height != peak_height:
+            await weight_proof_peer.close(600)
+            raise RuntimeError(f"Weight proof had the wrong height: {weight_proof_peer.peer_info.host}")
+        if response.wp.recent_chain_data[-1].reward_chain_block.weight != peak_weight:
+            await weight_proof_peer.close(600)
+            raise RuntimeError(f"Weight proof had the wrong weight: {weight_proof_peer.peer_info.host}")
+        if self.in_bad_peak_cache(response.wp):
+            raise ValueError("Weight proof failed bad peak cache validation")
+        # dont sync to wp if local peak is heavier,
+        # dont ban peer, we asked for this peak
+        current_peak = self.blockchain.get_peak()
+        if current_peak is not None:
+            if response.wp.recent_chain_data[-1].reward_chain_block.weight <= current_peak.weight:
+                raise RuntimeError(
+                    f"current peak is heavier than Weight proof peek: {weight_proof_peer.peer_info.host}"
+                )
+        try:
+            validated, fork_point, summaries = await self.weight_proof_handler.validate_weight_proof(response.wp)
+        except Exception as e:
+            await weight_proof_peer.close(600)
+            raise ValueError(f"Weight proof validation threw an error {e}")
+        if not validated:
+            await weight_proof_peer.close(600)
+            raise ValueError("Weight proof validation failed")
+        self.log.info(f"Re-checked peers: total of {len(peers_with_peak)} peers with peak {peak_height}")
+        self.sync_store.set_sync_mode(True)
+        self._state_changed("sync_mode")
+        return fork_point, summaries
+
     async def sync_from_fork_point(
-        self,
-        fork_point_height: uint32,
-        target_peak_sb_height: uint32,
-        peak_hash: bytes32,
-        summaries: List[SubEpochSummary],
-    ):
+            self,
+            fork_point_height: uint32,
+            target_peak_sb_height: uint32,
+            peak_hash: bytes32,
+            summaries: List[SubEpochSummary],
+    ) -> None:
         buffer_size = 4
         self.log.info(f"Start syncing from fork point at {fork_point_height} up to {target_peak_sb_height}")
-        peers_with_peak = self.get_peers_with_peak(peak_hash)
+        peers_with_peak: List[WSGoldConnection] = self.get_peers_with_peak(peak_hash)
         fork_point_height = await check_fork_next_block(
             self.blockchain, fork_point_height, peers_with_peak, node_next_block_check
         )
         batch_size = self.constants.MAX_BLOCK_COUNT_PER_REQUESTS
 
-        async def fetch_block_batches(batch_queue, peers_with_peak: List[ws.WSChiaConnection]):
+        # normally "fork_point" or "fork_height" refers to the first common
+        # block between the main chain and the fork. Here "fork_point_height"
+        # seems to refer to the first diverging block
+
+        async def fetch_block_batches(
+                batch_queue: asyncio.Queue[Optional[Tuple[WSGoldConnection, List[FullBlock]]]]
+        ) -> None:
+            start_height, end_height = 0, 0
+            new_peers_with_peak: List[WSGoldConnection] = peers_with_peak[:]
             try:
-                for start_height in range(fork_point_height, target_peak_sb_height, batch_size):
-                    end_height = min(target_peak_sb_height, start_height + batch_size)
+                # block request ranges are *inclusive*, this requires some
+                # gymnastics of this range (+1 to make it exclusive, like normal
+                # ranges) and then -1 when forming the request message
+                for start_height in range(fork_point_height, target_peak_sb_height + 1, batch_size):
+                    end_height = min(target_peak_sb_height, start_height + batch_size - 1)
                     request = RequestBlocks(uint32(start_height), uint32(end_height), True)
                     fetched = False
-                    for peer in random.sample(peers_with_peak, len(peers_with_peak)):
+                    for peer in random.sample(new_peers_with_peak, len(new_peers_with_peak)):
                         if peer.closed:
-                            peers_with_peak.remove(peer)
                             continue
-                        response = await peer.request_blocks(request, timeout=10)
+                        response = await peer.call_api(FullNodeAPI.request_blocks, request, timeout=30)
                         if response is None:
                             await peer.close()
-                            peers_with_peak.remove(peer)
                         elif isinstance(response, RespondBlocks):
                             await batch_queue.put((peer, response.blocks))
                             fetched = True
                             break
                     if fetched is False:
                         self.log.error(f"failed fetching {start_height} to {end_height} from peers")
-                        await batch_queue.put(None)
                         return
                     if self.sync_store.peers_changed.is_set():
-                        peers_with_peak = self.get_peers_with_peak(peak_hash)
+                        new_peers_with_peak = self.get_peers_with_peak(peak_hash)
                         self.sync_store.peers_changed.clear()
             except Exception as e:
                 self.log.error(f"Exception fetching {start_height} to {end_height} from peer {e}")
@@ -902,183 +1107,255 @@ class FullNode:
                 # finished signal with None
                 await batch_queue.put(None)
 
-        async def validate_block_batches(batch_queue):
-            advanced_peak = False
+        async def validate_block_batches(
+                inner_batch_queue: asyncio.Queue[Optional[Tuple[WSGoldConnection, List[FullBlock]]]]
+        ) -> None:
+            fork_info: Optional[ForkInfo] = None
+
             while True:
-                res = await batch_queue.get()
+                res: Optional[Tuple[WSGoldConnection, List[FullBlock]]] = await inner_batch_queue.get()
                 if res is None:
                     self.log.debug("done fetching blocks")
-                    return
+                    return None
                 peer, blocks = res
                 start_height = blocks[0].height
                 end_height = blocks[-1].height
-                success, advanced_peak, fork_height, coin_states = await self.receive_block_batch(
-                    blocks, peer, None if advanced_peak else uint32(fork_point_height), summaries
+
+                # in case we're validating a reorg fork (i.e. not extending the
+                # main chain), we need to record the coin set from that fork in
+                # fork_info. Otherwise validation is very expensive, especially
+                # for deep reorgs
+                peak: Optional[BlockRecord]
+                if fork_info is None:
+                    peak = self.blockchain.get_peak()
+                    extending_main_chain: bool = peak is None or (
+                            peak.header_hash == blocks[0].prev_header_hash or peak.header_hash == blocks[0].header_hash
+                    )
+                    # if we're simply extending the main chain, it's important
+                    # *not* to pass in a ForkInfo object, as it can potentially
+                    # accrue a large state (with no value, since we can validate
+                    # against the CoinStore)
+                    if not extending_main_chain:
+                        if fork_point_height == 0:
+                            fork_info = ForkInfo(-1, -1, self.constants.GENESIS_CHALLENGE)
+                        else:
+                            fork_hash = self.blockchain.height_to_hash(uint32(fork_point_height - 1))
+                            assert fork_hash is not None
+                            fork_info = ForkInfo(fork_point_height - 1, fork_point_height - 1, fork_hash)
+
+                success, state_change_summary, err = await self.add_block_batch(
+                    blocks,
+                    peer.get_peer_logging(),
+                    fork_info,
+                    summaries,
                 )
                 if success is False:
-                    if peer in peers_with_peak:
-                        peers_with_peak.remove(peer)
                     await peer.close(600)
                     raise ValueError(f"Failed to validate block batch {start_height} to {end_height}")
                 self.log.info(f"Added blocks {start_height} to {end_height}")
-                await self.send_peak_to_wallets()
                 peak = self.blockchain.get_peak()
-                if len(coin_states) > 0 and fork_height is not None:
-                    await self.update_wallets(peak.height, fork_height, peak.header_hash, coin_states)
+                if state_change_summary is not None:
+                    assert peak is not None
+                    # Hints must be added to the DB. The other post-processing tasks are not required when syncing
+                    hints_to_add, _ = get_hints_and_subscription_coin_ids(
+                        state_change_summary,
+                        self.subscriptions.has_coin_subscription,
+                        self.subscriptions.has_puzzle_subscription,
+                    )
+                    await self.hint_store.add_hints(hints_to_add)
+                # Note that end_height is not necessarily the peak at this
+                # point. In case of a re-org, it may even be significantly
+                # higher than _peak_height, and still not be the peak.
+                # clean_block_record() will not necessarily honor this cut-off
+                # height, in that case.
                 self.blockchain.clean_block_record(end_height - self.constants.BLOCKS_CACHE_SIZE)
 
-        loop = asyncio.get_event_loop()
-        batch_queue: asyncio.Queue[Tuple[ws.WSChiaConnection, List[FullBlock]]] = asyncio.Queue(
-            loop=loop, maxsize=buffer_size
+        batch_queue_input: asyncio.Queue[Optional[Tuple[WSGoldConnection, List[FullBlock]]]] = asyncio.Queue(
+            maxsize=buffer_size
         )
-        fetch_task = asyncio.Task(fetch_block_batches(batch_queue, peers_with_peak))
-        validate_task = asyncio.Task(validate_block_batches(batch_queue))
+        fetch_task = asyncio.Task(fetch_block_batches(batch_queue_input))
+        validate_task = asyncio.Task(validate_block_batches(batch_queue_input))
         try:
-            await asyncio.gather(fetch_task, validate_task)
-        except Exception as e:
+            with log_exceptions(log=self.log, message="sync from fork point failed"):
+                await asyncio.gather(fetch_task, validate_task)
+        except Exception:
             assert validate_task.done()
             fetch_task.cancel()  # no need to cancel validate_task, if we end up here validate_task is already done
-            self.log.error(f"sync from fork point failed err: {e}")
 
-    async def send_peak_to_wallets(self):
-        peak = self.blockchain.get_peak()
-        assert peak is not None
-        msg = make_msg(
-            ProtocolMessageTypes.new_peak_wallet,
-            wallet_protocol.NewPeakWallet(
-                peak.header_hash, peak.height, peak.weight, uint32(max(peak.height - 1, uint32(0)))
-            ),
-        )
-        await self.server.send_to_all([msg], NodeType.WALLET)
-
-    def get_peers_with_peak(self, peak_hash: bytes32) -> List:
+    def get_peers_with_peak(self, peak_hash: bytes32) -> List[WSGoldConnection]:
         peer_ids: Set[bytes32] = self.sync_store.get_peers_that_have_peak([peak_hash])
         if len(peer_ids) == 0:
             self.log.warning(f"Not syncing, no peers with header_hash {peak_hash} ")
             return []
-        peers_with_peak: List = [c for c in self.server.all_connections.values() if c.peer_node_id in peer_ids]
-        return peers_with_peak
+        return [c for c in self.server.all_connections.values() if c.peer_node_id in peer_ids]
 
-    async def update_wallets(
-        self,
-        height: uint32,
-        fork_height: uint32,
-        peak_hash: bytes32,
-        state_update: Tuple[List[CoinRecord], Dict[bytes, Dict[bytes32, CoinRecord]]],
-    ):
+    async def _wallets_sync_task_handler(self) -> None:
+        while not self._shut_down:
+            try:
+                wallet_update = await self.wallet_sync_queue.get()
+                await self.update_wallets(wallet_update)
+            except Exception:
+                self.log.exception("Wallet sync task failure")
+                continue
+
+    async def update_wallets(self, wallet_update: WalletUpdate) -> None:
+        self.log.debug(
+            f"update_wallets - fork_height: {wallet_update.fork_height}, peak_height: {wallet_update.peak.height}"
+        )
         changes_for_peer: Dict[bytes32, Set[CoinState]] = {}
-
-        states, hint_state = state_update
-
-        for coin_record in states:
-            if coin_record.name in self.coin_subscriptions:
-                subscribed_peers = self.coin_subscriptions[coin_record.name]
-                for peer in subscribed_peers:
-                    if peer not in changes_for_peer:
-                        changes_for_peer[peer] = set()
-                    changes_for_peer[peer].add(coin_record.coin_state)
-
-            if coin_record.coin.puzzle_hash in self.ph_subscriptions:
-                subscribed_peers = self.ph_subscriptions[coin_record.coin.puzzle_hash]
-                for peer in subscribed_peers:
-                    if peer not in changes_for_peer:
-                        changes_for_peer[peer] = set()
-                    changes_for_peer[peer].add(coin_record.coin_state)
-
-        for hint, records in hint_state.items():
-            if hint in self.ph_subscriptions:
-                subscribed_peers = self.ph_subscriptions[hint]
-                for peer in subscribed_peers:
-                    if peer not in changes_for_peer:
-                        changes_for_peer[peer] = set()
-                    for record in records.values():
-                        changes_for_peer[peer].add(record.coin_state)
+        for coin_record in wallet_update.coin_records:
+            coin_id = coin_record.name
+            subscribed_peers = self.subscriptions.peers_for_coin_id(coin_id)
+            subscribed_peers.update(self.subscriptions.peers_for_puzzle_hash(coin_record.coin.puzzle_hash))
+            hint = wallet_update.hints.get(coin_id)
+            if hint is not None:
+                subscribed_peers.update(self.subscriptions.peers_for_puzzle_hash(hint))
+            for peer in subscribed_peers:
+                changes_for_peer.setdefault(peer, set()).add(coin_record.coin_state)
 
         for peer, changes in changes_for_peer.items():
-            if peer not in self.server.all_connections:
-                continue
-            ws_peer: ws.WSChiaConnection = self.server.all_connections[peer]
-            state = CoinStateUpdate(height, fork_height, peak_hash, list(changes))
-            msg = make_msg(ProtocolMessageTypes.coin_state_update, state)
-            await ws_peer.send_message(msg)
+            connection = self.server.all_connections.get(peer)
+            if connection is not None:
+                state = CoinStateUpdate(
+                    wallet_update.peak.height,
+                    wallet_update.fork_height,
+                    wallet_update.peak.header_hash,
+                    list(changes),
+                )
+                await connection.send_message(make_msg(ProtocolMessageTypes.coin_state_update, state))
 
-    async def receive_block_batch(
-        self,
-        all_blocks: List[FullBlock],
-        peer: ws.WSChiaConnection,
-        fork_point: Optional[uint32],
-        wp_summaries: Optional[List[SubEpochSummary]] = None,
-    ) -> Tuple[bool, bool, Optional[uint32], Tuple[List[CoinRecord], Dict[bytes, Dict[bytes, CoinRecord]]]]:
-        advanced_peak = False
-        fork_height: Optional[uint32] = uint32(0)
+        # Tell wallets about the new peak
+        new_peak_message = make_msg(
+            ProtocolMessageTypes.new_peak_wallet,
+            wallet_protocol.NewPeakWallet(
+                wallet_update.peak.header_hash,
+                wallet_update.peak.height,
+                wallet_update.peak.weight,
+                wallet_update.fork_height,
+            ),
+        )
+        await self.server.send_to_all([new_peak_message], NodeType.WALLET)
+
+    async def add_block_batch(
+            self,
+            all_blocks: List[FullBlock],
+            peer_info: PeerInfo,
+            fork_info: Optional[ForkInfo],
+            wp_summaries: Optional[List[SubEpochSummary]] = None,
+    ) -> Tuple[bool, Optional[StateChangeSummary], Optional[Err]]:
+        # Precondition: All blocks must be contiguous blocks, index i+1 must be the parent of index i
+        # Returns a bool for success, as well as a StateChangeSummary if the peak was advanced
+
+        block_dict: Dict[bytes32, FullBlock] = {}
+        for block in all_blocks:
+            block_dict[block.header_hash] = block
 
         blocks_to_validate: List[FullBlock] = []
         for i, block in enumerate(all_blocks):
-            # If the block is not on current chain, re-validate
-            if not self.blockchain.contains_block_in_peak_chain(block.header_hash):
+            header_hash = block.header_hash
+            if not await self.blockchain.contains_block_from_db(header_hash):
                 blocks_to_validate = all_blocks[i:]
                 break
+
+            if fork_info is None:
+                continue
+            # the below section updates the fork_info object, if
+            # there is one.
+
+            # TODO: it seems unnecessary to request overlapping block ranges
+            # when syncing
+            if block.height <= fork_info.peak_height:
+                continue
+
+            # we have already validated this block once, no need to do it again.
+            # however, if this block is not part of the main chain, we need to
+            # update the fork context with its additions and removals
+            if self.blockchain.height_to_hash(block.height) == header_hash:
+                # we're on the main chain, just fast-forward the fork height
+                fork_info.reset(block.height, header_hash)
+            else:
+                # We have already validated the block, but if it's not part of the
+                # main chain, we still need to re-run it to update the additions and
+                # removals in fork_info.
+                await self.blockchain.advance_fork_info(block, fork_info, block_dict)
+                await self.blockchain.run_single_block(block, fork_info, block_dict)
+
         if len(blocks_to_validate) == 0:
-            return True, False, fork_height, ([], {})
+            return True, None, None
 
-        pre_validate_start = time.time()
-        pre_validation_results: Optional[
-            List[PreValidationResult]
-        ] = await self.blockchain.pre_validate_blocks_multiprocessing(blocks_to_validate, {}, wp_summaries=wp_summaries)
-        pre_validate_end = time.time()
-        if pre_validate_end - pre_validate_start > 10:
-            self.log.warning(f"Block pre-validation time: {pre_validate_end - pre_validate_start:0.2f} seconds")
-        else:
-            self.log.debug(f"Block pre-validation time: {pre_validate_end - pre_validate_start:0.2f} seconds")
-        if pre_validation_results is None:
-            return False, False, None, ([], {})
-        for i, block in enumerate(blocks_to_validate):
-            if pre_validation_results[i].error is not None:
-                self.log.error(
-                    f"Invalid block from peer: {peer.get_peer_logging()} {Err(pre_validation_results[i].error)}"
-                )
-                return False, advanced_peak, fork_height, ([], {})
-
-        # Dicts because deduping
-        all_coin_changes: Dict[bytes32, CoinRecord] = {}
-        all_hint_changes: Dict[bytes, Dict[bytes32, CoinRecord]] = {}
-
-        for i, block in enumerate(blocks_to_validate):
-            assert pre_validation_results[i].required_iters is not None
-            result, error, fork_height, coin_changes = await self.blockchain.receive_block(
-                block, pre_validation_results[i], None if advanced_peak else fork_point
+        # Validates signatures in multiprocessing since they take a while, and we don't have cached transactions
+        # for these blocks (unlike during normal operation where we validate one at a time)
+        pre_validate_start = time.monotonic()
+        agg_state_change_summary: Optional[StateChangeSummary] = None
+        timing = 0.0
+        for block in blocks_to_validate:
+            pre_validation_results: List[
+                PreValidationResult] = await self.blockchain.pre_validate_blocks_multiprocessing(
+                [block], {}, wp_summaries=wp_summaries, validate_signatures=True
             )
-            self.log.info(f"[debug] post receive block {block.height} {fork_height}")
-            coin_record_list, hint_records = coin_changes
 
-            # Update all changes
-            for record in coin_record_list:
-                all_coin_changes[record.name] = record
-            for hint, list_of_records in hint_records.items():
-                if hint not in all_hint_changes:
-                    all_hint_changes[hint] = {}
-                for record in list_of_records.values():
-                    all_hint_changes[hint][record.name] = record
+            if pre_validation_results[0].error is not None:
+                self.log.error(f"Invalid block from peer: {peer_info} {Err(pre_validation_results[0].error)}")
+                return False, None, Err(pre_validation_results[0].error)
 
-            if result == ReceiveBlockResult.NEW_PEAK:
-                advanced_peak = True
-            elif result == ReceiveBlockResult.INVALID_BLOCK or result == ReceiveBlockResult.DISCONNECTED_BLOCK:
+            timing += pre_validation_results[0].timing / 1000.0
+            assert pre_validation_results[0].required_iters is not None
+            state_change_summary: Optional[StateChangeSummary]
+            # when adding blocks in batches, we won't have any overlapping
+            # signatures with the mempool. There won't be any cache hits, so
+            # there's no need to pass the BLS cache in
+            result, error, state_change_summary = await self.blockchain.add_block(
+                block, pre_validation_results[0], None, fork_info
+            )
+
+            if result == AddBlockResult.NEW_PEAK:
+                # since this block just added a new peak, we've don't need any
+                # fork history from fork_info anymore
+                if fork_info is not None:
+                    fork_info.reset(block.height, block.header_hash)
+                assert state_change_summary is not None
+                # Since all blocks are contiguous, we can simply append the rollback changes and npc results
+                if agg_state_change_summary is None:
+                    agg_state_change_summary = state_change_summary
+                else:
+                    # Keeps the old, original fork_height, since the next blocks will have fork height h-1
+                    # Groups up all state changes into one
+                    agg_state_change_summary = StateChangeSummary(
+                        state_change_summary.peak,
+                        agg_state_change_summary.fork_height,
+                        agg_state_change_summary.rolled_back_records + state_change_summary.rolled_back_records,
+                        agg_state_change_summary.removals + state_change_summary.removals,
+                        agg_state_change_summary.additions + state_change_summary.additions,
+                        agg_state_change_summary.new_rewards + state_change_summary.new_rewards,
+                    )
+            elif result == AddBlockResult.INVALID_BLOCK or result == AddBlockResult.DISCONNECTED_BLOCK:
                 if error is not None:
-                    self.log.error(f"Error: {error}, Invalid block from peer: {peer.get_peer_logging()} ")
-                return False, advanced_peak, fork_height, ([], {})
-            block_record = self.blockchain.block_record(block.header_hash)
+                    self.log.error(f"Error: {error}, Invalid block from peer: {peer_info} ")
+                return False, agg_state_change_summary, error
+            block_record = await self.blockchain.get_block_record_from_db(block.header_hash)
+            assert block_record is not None
             if block_record.sub_epoch_summary_included is not None:
                 if self.weight_proof_handler is not None:
                     await self.weight_proof_handler.create_prev_sub_epoch_segments()
-        if advanced_peak:
+        pre_validate_end = time.monotonic()
+        pre_validate_time = pre_validate_end - pre_validate_start
+
+        self.log.log(
+            logging.WARNING if pre_validate_time > 10 else logging.DEBUG,
+            f"Block pre-validation: {pre_validate_end - pre_validate_start:0.2f}s "
+            f"CLVM: {timing:0.2f}s "
+            f"({len(blocks_to_validate)} blocks, start height: {blocks_to_validate[0].height})",
+        )
+
+        if agg_state_change_summary is not None:
             self._state_changed("new_peak")
             self.log.debug(
-                f"Total time for {len(blocks_to_validate)} blocks: {time.time() - pre_validate_start}, "
-                f"advanced: {advanced_peak}"
+                f"Total time for {len(blocks_to_validate)} blocks: {time.monotonic() - pre_validate_start}, "
+                f"advanced: True"
             )
-        return True, advanced_peak, fork_height, (list(all_coin_changes.values()), all_hint_changes)
+        return True, agg_state_change_summary, None
 
-    async def _finish_sync(self):
+    async def _finish_sync(self) -> None:
         """
         Finalize sync by setting sync mode to False, clearing all sync information, and adding any final
         blocks that we have finalized recently.
@@ -1087,56 +1364,55 @@ class FullNode:
         self.sync_store.set_long_sync(False)
         self.sync_store.set_sync_mode(False)
         self._state_changed("sync_mode")
-        if self.server is None:
+        if self._server is None:
             return None
 
-        peak: Optional[BlockRecord] = self.blockchain.get_peak()
-        async with self._blockchain_lock_high_priority:
-            await self.sync_store.clear_sync_info()
-
-            peak_fb: FullBlock = await self.blockchain.get_full_peak()
-            if peak is not None:
-                mempool_new_peak_result, fns_peak_result = await self.peak_post_processing(
-                    peak_fb, peak, max(peak.height - 1, 0), None, []
+        async with self.blockchain.priority_mutex.acquire(priority=BlockchainMutexPriority.high):
+            peak: Optional[BlockRecord] = self.blockchain.get_peak()
+            peak_fb: Optional[FullBlock] = await self.blockchain.get_full_peak()
+            if peak_fb is not None:
+                assert peak is not None
+                state_change_summary = StateChangeSummary(peak, uint32(max(peak.height - 1, 0)), [], [], [], [])
+                ppp_result: PeakPostProcessingResult = await self.peak_post_processing(
+                    peak_fb, state_change_summary, None
                 )
-
-                await self.peak_post_processing_2(
-                    peak_fb, peak, max(peak.height - 1, 0), None, ([], {}), mempool_new_peak_result, fns_peak_result
-                )
+                await self.peak_post_processing_2(peak_fb, None, state_change_summary, ppp_result)
 
         if peak is not None and self.weight_proof_handler is not None:
             await self.weight_proof_handler.get_proof_of_weight(peak.header_hash)
             self._state_changed("block")
 
-    def has_valid_pool_sig(self, block: Union[UnfinishedBlock, FullBlock]):
+    def has_valid_pool_sig(self, block: Union[UnfinishedBlock, FullBlock]) -> bool:
         if (
-            block.foliage.foliage_block_data.pool_target
-            == PoolTarget(self.constants.GENESIS_PRE_FARM_POOL_PUZZLE_HASH, uint32(0))
-            and block.foliage.prev_block_hash != self.constants.GENESIS_CHALLENGE
-            and block.reward_chain_block.proof_of_space.pool_public_key is not None
+                block.foliage.foliage_block_data.pool_target
+                == PoolTarget(self.constants.GENESIS_PRE_FARM_POOL_PUZZLE_HASH, uint32(0))
+                and block.foliage.prev_block_hash != self.constants.GENESIS_CHALLENGE
+                and block.reward_chain_block.proof_of_space.pool_public_key is not None
         ):
+            assert block.foliage.foliage_block_data.pool_signature is not None
             if not AugSchemeMPL.verify(
-                block.reward_chain_block.proof_of_space.pool_public_key,
-                bytes(block.foliage.foliage_block_data.pool_target),
-                block.foliage.foliage_block_data.pool_signature,
+                    block.reward_chain_block.proof_of_space.pool_public_key,
+                    bytes(block.foliage.foliage_block_data.pool_target),
+                    block.foliage.foliage_block_data.pool_signature,
             ):
                 return False
         return True
 
     async def signage_point_post_processing(
-        self,
-        request: full_node_protocol.RespondSignagePoint,
-        peer: ws.WSChiaConnection,
-        ip_sub_slot: Optional[EndOfSubSlotBundle],
-    ):
+            self,
+            request: full_node_protocol.RespondSignagePoint,
+            peer: WSGoldConnection,
+            ip_sub_slot: Optional[EndOfSubSlotBundle],
+    ) -> None:
         self.log.info(
             f"⏲️  Finished signage point {request.index_from_challenge}/"
             f"{self.constants.NUM_SPS_SUB_SLOT}: "
-            f"CC: {request.challenge_chain_vdf.output.get_hash()} "
-            f"RC: {request.reward_chain_vdf.output.get_hash()} "
+            f"CC: {request.challenge_chain_vdf.output.get_hash().hex()} "
+            f"RC: {request.reward_chain_vdf.output.get_hash().hex()} "
         )
         self.signage_point_times[request.index_from_challenge] = time.time()
         sub_slot_tuple = self.full_node_store.get_sub_slot(request.challenge_chain_vdf.challenge)
+        prev_challenge: Optional[bytes32]
         if sub_slot_tuple is not None:
             prev_challenge = sub_slot_tuple[0].challenge_chain.challenge_chain_end_of_slot_vdf.challenge
         else:
@@ -1150,7 +1426,7 @@ class FullNode:
             request.reward_chain_vdf.challenge,
         )
         msg = make_msg(ProtocolMessageTypes.new_signage_point_or_end_of_sub_slot, broadcast)
-        await self.server.send_to_all_except([msg], NodeType.FULL_NODE, peer.peer_node_id)
+        await self.server.send_to_all([msg], NodeType.FULL_NODE, peer.peer_node_id)
 
         peak = self.blockchain.get_peak()
         if peak is not None and peak.height > self.constants.MAX_SUB_SLOT_BLOCKS:
@@ -1175,39 +1451,58 @@ class FullNode:
             difficulty,
             sub_slot_iters,
             request.index_from_challenge,
+            uint32(0) if peak is None else peak.height,
+            sp_source_data=SignagePointSourceData(
+                vdf_data=SPVDFSourceData(request.challenge_chain_vdf.output, request.reward_chain_vdf.output)
+            ),
         )
         msg = make_msg(ProtocolMessageTypes.new_signage_point, broadcast_farmer)
         await self.server.send_to_all([msg], NodeType.FARMER)
 
+        self._state_changed("signage_point", {"broadcast_farmer": broadcast_farmer})
+
     async def peak_post_processing(
-        self,
-        block: FullBlock,
-        record: BlockRecord,
-        fork_height: uint32,
-        peer: Optional[ws.WSChiaConnection],
-        coin_changes: List[CoinRecord],
-    ):
+            self,
+            block: FullBlock,
+            state_change_summary: StateChangeSummary,
+            peer: Optional[WSGoldConnection],
+    ) -> PeakPostProcessingResult:
         """
-        Must be called under self.blockchain.lock. This updates the internal state of the full node with the
+        Must be called under self.blockchain.priority_mutex. This updates the internal state of the full node with the
         latest peak information. It also notifies peers about the new peak.
         """
+
+        record = state_change_summary.peak
         difficulty = self.blockchain.get_next_difficulty(record.header_hash, False)
         sub_slot_iters = self.blockchain.get_next_slot_iters(record.header_hash, False)
 
         self.log.info(
             f"🌱 Updated peak to height {record.height}, weight {record.weight}, "
-            f"hh {record.header_hash}, "
-            f"forked at {fork_height}, rh: {record.reward_infusion_new_challenge}, "
+            f"hh {record.header_hash.hex()}, "
+            f"forked at {state_change_summary.fork_height}, rh: {record.reward_infusion_new_challenge.hex()}, "
             f"total iters: {record.total_iters}, "
             f"overflow: {record.overflow}, "
             f"deficit: {record.deficit}, "
             f"difficulty: {difficulty}, "
             f"sub slot iters: {sub_slot_iters}, "
             f"Generator size: "
-            f"{len(bytes(block.transactions_generator)) if  block.transactions_generator else 'No tx'}, "
+            f"{len(bytes(block.transactions_generator)) if block.transactions_generator else 'No tx'}, "
             f"Generator ref list size: "
             f"{len(block.transactions_generator_ref_list) if block.transactions_generator else 'No tx'}"
         )
+
+        if (
+                self.full_node_store.previous_generator is not None
+                and state_change_summary.fork_height < self.full_node_store.previous_generator.block_height
+        ):
+            self.full_node_store.previous_generator = None
+
+        hints_to_add, lookup_coin_ids = get_hints_and_subscription_coin_ids(
+            state_change_summary,
+            self.subscriptions.has_coin_subscription,
+            self.subscriptions.has_puzzle_subscription,
+        )
+        await self.hint_store.add_hints(hints_to_add)
 
         sub_slots = await self.blockchain.get_sp_and_ip_sub_slots(record.header_hash)
         assert sub_slots is not None
@@ -1216,9 +1511,11 @@ class FullNode:
             self.blockchain.clean_block_records()
 
         fork_block: Optional[BlockRecord] = None
-        if fork_height != block.height - 1 and block.height != 0:
+        if state_change_summary.fork_height != block.height - 1 and block.height != 0:
             # This is a reorg
-            fork_block = self.blockchain.block_record(self.blockchain.height_to_hash(fork_height))
+            fork_hash: Optional[bytes32] = self.blockchain.height_to_hash(state_change_summary.fork_height)
+            assert fork_hash is not None
+            fork_block = await self.blockchain.get_block_record_from_db(fork_hash)
 
         fns_peak_result: FullNodeStorePeakResult = self.full_node_store.new_peak(
             record,
@@ -1227,15 +1524,17 @@ class FullNode:
             sub_slots[1],
             fork_block,
             self.blockchain,
+            sub_slot_iters,
+            difficulty,
         )
 
         if fns_peak_result.new_signage_points is not None and peer is not None:
             for index, sp in fns_peak_result.new_signage_points:
                 assert (
-                    sp.cc_vdf is not None
-                    and sp.cc_proof is not None
-                    and sp.rc_vdf is not None
-                    and sp.rc_proof is not None
+                        sp.cc_vdf is not None
+                        and sp.cc_proof is not None
+                        and sp.rc_vdf is not None
+                        and sp.rc_proof is not None
                 )
                 await self.signage_point_post_processing(
                     RespondSignagePoint(index, sp.cc_vdf, sp.cc_proof, sp.rc_vdf, sp.rc_proof), peer, sub_slots[1]
@@ -1259,9 +1558,8 @@ class FullNode:
         )
 
         # Update the mempool (returns successful pending transactions added to the mempool)
-        mempool_new_peak_result: List[Tuple[SpendBundle, NPCResult, bytes32]] = await self.mempool_manager.new_peak(
-            self.blockchain.get_peak(), coin_changes
-        )
+        spent_coins: List[bytes32] = [coin_id for coin_id, _ in state_change_summary.removals]
+        mempool_new_peak_result = await self.mempool_manager.new_peak(self.blockchain.get_tx_peak(), spent_coins)
 
         # Check if we detected a spent transaction, to load up our generator cache
         if block.transactions_generator is not None and self.full_node_store.previous_generator is None:
@@ -1269,44 +1567,40 @@ class FullNode:
             if generator_arg:
                 self.log.info(f"Saving previous generator for height {block.height}")
                 self.full_node_store.previous_generator = generator_arg
-        return mempool_new_peak_result, fns_peak_result
+
+        return PeakPostProcessingResult(
+            mempool_new_peak_result.items,
+            mempool_new_peak_result.removals,
+            fns_peak_result,
+            hints_to_add,
+            lookup_coin_ids,
+        )
 
     async def peak_post_processing_2(
-        self,
-        block: FullBlock,
-        record: BlockRecord,
-        fork_height: uint32,
-        peer: Optional[ws.WSChiaConnection],
-        coin_changes: Tuple[List[CoinRecord], Dict[bytes, Dict[bytes32, CoinRecord]]],
-        mempool_peak_result: List[Tuple[SpendBundle, NPCResult, bytes32]],
-        fns_peak_result: FullNodeStorePeakResult,
-    ):
+            self,
+            block: FullBlock,
+            peer: Optional[WSGoldConnection],
+            state_change_summary: StateChangeSummary,
+            ppp_result: PeakPostProcessingResult,
+    ) -> None:
         """
         Does NOT need to be called under the blockchain lock. Handle other parts of post processing like communicating
         with peers
         """
-        for bundle, result, spend_name in mempool_peak_result:
-            self.log.debug(f"Added transaction to mempool: {spend_name}")
-            mempool_item = self.mempool_manager.get_mempool_item(spend_name)
+        record = state_change_summary.peak
+        for new_peak_item in ppp_result.mempool_peak_result:
+            self.log.debug(f"Added transaction to mempool: {new_peak_item.transaction_id}")
+            mempool_item = self.mempool_manager.get_mempool_item(new_peak_item.transaction_id)
             assert mempool_item is not None
-            fees = mempool_item.fee
-            assert fees >= 0
-            assert mempool_item.cost is not None
-            new_tx = full_node_protocol.NewTransaction(
-                spend_name,
-                mempool_item.cost,
-                uint64(bundle.fees()),
-            )
-            msg = make_msg(ProtocolMessageTypes.new_transaction, new_tx)
-            await self.server.send_to_all([msg], NodeType.FULL_NODE)
+            await self.broadcast_added_tx(mempool_item)
 
         # If there were pending end of slots that happen after this peak, broadcast them if they are added
-        if fns_peak_result.added_eos is not None:
+        if ppp_result.fns_peak_result.added_eos is not None:
             broadcast = full_node_protocol.NewSignagePointOrEndOfSubSlot(
-                fns_peak_result.added_eos.challenge_chain.challenge_chain_end_of_slot_vdf.challenge,
-                fns_peak_result.added_eos.challenge_chain.get_hash(),
+                ppp_result.fns_peak_result.added_eos.challenge_chain.challenge_chain_end_of_slot_vdf.challenge,
+                ppp_result.fns_peak_result.added_eos.challenge_chain.get_hash(),
                 uint8(0),
-                fns_peak_result.added_eos.reward_chain.end_of_slot_vdf.challenge,
+                ppp_result.fns_peak_result.added_eos.reward_chain.end_of_slot_vdf.challenge,
             )
             msg = make_msg(ProtocolMessageTypes.new_signage_point_or_end_of_sub_slot, broadcast)
             await self.server.send_to_all([msg], NodeType.FULL_NODE)
@@ -1315,11 +1609,11 @@ class FullNode:
 
         if record.height % 1000 == 0:
             # Occasionally clear data in full node store to keep memory usage small
-            self.full_node_store.clear_seen_unfinished_blocks()
             self.full_node_store.clear_old_cache_entries()
 
         if self.sync_store.get_sync_mode() is False:
             await self.send_peak_to_timelords(block)
+            await self.broadcast_removed_tx(ppp_result.mempool_removals)
 
             # Tell full nodes about the new peak
             msg = make_msg(
@@ -1328,38 +1622,48 @@ class FullNode:
                     record.header_hash,
                     record.height,
                     record.weight,
-                    fork_height,
+                    state_change_summary.fork_height,
                     block.reward_chain_block.get_unfinished().get_hash(),
                 ),
             )
             if peer is not None:
-                await self.server.send_to_all_except([msg], NodeType.FULL_NODE, peer.peer_node_id)
+                await self.server.send_to_all([msg], NodeType.FULL_NODE, peer.peer_node_id)
             else:
                 await self.server.send_to_all([msg], NodeType.FULL_NODE)
 
-        # Tell wallets about the new peak
-        msg = make_msg(
-            ProtocolMessageTypes.new_peak_wallet,
-            wallet_protocol.NewPeakWallet(
-                record.header_hash,
-                record.height,
-                record.weight,
-                fork_height,
-            ),
+        coin_hints: Dict[bytes32, bytes32] = {
+            coin_id: bytes32(hint) for coin_id, hint in ppp_result.hints if len(hint) == 32
+        }
+
+        peak = Peak(
+            state_change_summary.peak.header_hash, state_change_summary.peak.height, state_change_summary.peak.weight
         )
-        await self.update_wallets(record.height, fork_height, record.header_hash, coin_changes)
-        await self.server.send_to_all([msg], NodeType.WALLET)
+
+        # Looks up coin records in DB for the coins that wallets are interested in
+        new_states = await self.coin_store.get_coin_records(ppp_result.lookup_coin_ids)
+
+        await self.wallet_sync_queue.put(
+            WalletUpdate(
+                state_change_summary.fork_height,
+                peak,
+                state_change_summary.rolled_back_records + new_states,
+                coin_hints,
+            )
+        )
+
         self._state_changed("new_peak")
 
-    async def respond_block(
-        self,
-        respond_block: full_node_protocol.RespondBlock,
-        peer: Optional[ws.WSChiaConnection] = None,
+    async def add_block(
+            self,
+            block: FullBlock,
+            peer: Optional[WSGoldConnection] = None,
+            bls_cache: Optional[BLSCache] = None,
+            raise_on_disconnected: bool = False,
+            fork_info: Optional[ForkInfo] = None,
     ) -> Optional[Message]:
         """
-        Receive a full block from a peer full node (or ourselves).
+        Add a full block from a peer full node (or ourselves).
         """
-        block: FullBlock = respond_block.block
         if self.sync_store.get_sync_mode():
             return None
 
@@ -1370,26 +1674,35 @@ class FullNode:
 
         pre_validation_result: Optional[PreValidationResult] = None
         if (
-            block.is_transaction_block()
-            and block.transactions_info is not None
-            and block.transactions_info.generator_root != bytes([0] * 32)
-            and block.transactions_generator is None
+                block.is_transaction_block()
+                and block.transactions_info is not None
+                and block.transactions_info.generator_root != bytes([0] * 32)
+                and block.transactions_generator is None
         ):
             # This is the case where we already had the unfinished block, and asked for this block without
             # the transactions (since we already had them). Therefore, here we add the transactions.
             unfinished_rh: bytes32 = block.reward_chain_block.get_unfinished().get_hash()
-            unf_block: Optional[UnfinishedBlock] = self.full_node_store.get_unfinished_block(unfinished_rh)
+            foliage_hash: Optional[bytes32] = block.foliage.foliage_transaction_block_hash
+            assert foliage_hash is not None
+            unf_entry: Optional[UnfinishedBlockEntry] = self.full_node_store.get_unfinished_block_result(
+                unfinished_rh, foliage_hash
+            )
             if (
-                unf_block is not None
-                and unf_block.transactions_generator is not None
-                and unf_block.foliage_transaction_block == block.foliage_transaction_block
+                    unf_entry is not None
+                    and unf_entry.unfinished_block is not None
+                    and unf_entry.unfinished_block.transactions_generator is not None
+                    and unf_entry.unfinished_block.foliage_transaction_block == block.foliage_transaction_block
             ):
-                pre_validation_result = self.full_node_store.get_unfinished_block_result(unfinished_rh)
+                # We checked that the transaction block is the same, therefore all transactions and the signature
+                # must be identical in the unfinished and finished blocks. We can therefore use the cache.
+
+                # this is a transaction block, the foliage hash should be set
+                assert foliage_hash is not None
+                pre_validation_result = unf_entry.result
                 assert pre_validation_result is not None
-                block = dataclasses.replace(
-                    block,
-                    transactions_generator=unf_block.transactions_generator,
-                    transactions_generator_ref_list=unf_block.transactions_generator_ref_list,
+                block = block.replace(
+                    transactions_generator=unf_entry.unfinished_block.transactions_generator,
+                    transactions_generator_ref_list=unf_entry.unfinished_block.transactions_generator_ref_list,
                 )
             else:
                 # We still do not have the correct information for this block, perhaps there is a duplicate block
@@ -1397,8 +1710,8 @@ class FullNode:
                 if peer is None:
                     return None
 
-                block_response: Optional[Any] = await peer.request_block(
-                    full_node_protocol.RequestBlock(block.height, True)
+                block_response: Optional[Any] = await peer.call_api(
+                    FullNodeAPI.request_block, full_node_protocol.RequestBlock(block.height, True)
                 )
                 if block_response is None or not isinstance(block_response, full_node_protocol.RespondBlock):
                     self.log.warning(
@@ -1407,38 +1720,49 @@ class FullNode:
                     return None
                 new_block: FullBlock = block_response.block
                 if new_block.foliage_transaction_block != block.foliage_transaction_block:
-                    self.log.warning(f"Received the wrong block for height {block.height} {new_block.header_hash}")
+                    self.log.warning(
+                        f"Received the wrong block for height {block.height} {new_block.header_hash.hex()}"
+                    )
                     return None
                 assert new_block.transactions_generator is not None
 
                 self.log.debug(
-                    f"Wrong info in the cache for bh {new_block.header_hash}, there might be multiple blocks from the "
+                    f"Wrong info in the cache for bh {new_block.header_hash.hex()}, "
+                    f"there might be multiple blocks from the "
                     f"same farmer with the same pospace."
                 )
                 # This recursion ends here, we cannot recurse again because transactions_generator is not None
-                return await self.respond_block(block_response, peer)
-        coin_changes: Tuple[List[CoinRecord], Dict[bytes, Dict[bytes32, CoinRecord]]] = ([], {})
-        mempool_new_peak_result, fns_peak_result = None, None
-        async with self._blockchain_lock_high_priority:
+                return await self.add_block(new_block, peer, bls_cache)
+        state_change_summary: Optional[StateChangeSummary] = None
+        ppp_result: Optional[PeakPostProcessingResult] = None
+        async with self.blockchain.priority_mutex.acquire(priority=BlockchainMutexPriority.high), enable_profiler(
+                self.profile_block_validation
+        ) as pr:
             # After acquiring the lock, check again, because another asyncio thread might have added it
             if self.blockchain.contains_block(header_hash):
                 return None
-            validation_start = time.time()
+            validation_start = time.monotonic()
             # Tries to add the block to the blockchain, if we already validated transactions, don't do it again
             npc_results = {}
             if pre_validation_result is not None and pre_validation_result.npc_result is not None:
                 npc_results[block.height] = pre_validation_result.npc_result
-            pre_validation_results = await self.blockchain.pre_validate_blocks_multiprocessing([block], npc_results)
-            added: Optional[ReceiveBlockResult] = None
-            pre_validation_time = time.time() - validation_start
+
+            # Don't validate signatures because we want to validate them in the main thread later, since we have a
+            # cache available
+            pre_validation_results = await self.blockchain.pre_validate_blocks_multiprocessing(
+                [block], npc_results, validate_signatures=False
+            )
+            added: Optional[AddBlockResult] = None
+            pre_validation_time = time.monotonic() - validation_start
             try:
-                if pre_validation_results is None:
+                if len(pre_validation_results) < 1:
                     raise ValueError(f"Failed to validate block {header_hash} height {block.height}")
                 if pre_validation_results[0].error is not None:
                     if Err(pre_validation_results[0].error) == Err.INVALID_PREV_BLOCK_HASH:
-                        added = ReceiveBlockResult.DISCONNECTED_BLOCK
+                        added = AddBlockResult.DISCONNECTED_BLOCK
                         error_code: Optional[Err] = Err.INVALID_PREV_BLOCK_HASH
-                        fork_height: Optional[uint32] = None
+                    elif Err(pre_validation_results[0].error) == Err.TIMESTAMP_TOO_FAR_IN_FUTURE:
+                        raise TimestampError()
                     else:
                         raise ValueError(
                             f"Failed to validate block {header_hash} height "
@@ -1449,78 +1773,74 @@ class FullNode:
                         pre_validation_results[0] if pre_validation_result is None else pre_validation_result
                     )
                     assert result_to_validate.required_iters == pre_validation_results[0].required_iters
-                    added, error_code, fork_height, coin_changes = await self.blockchain.receive_block(
-                        block, result_to_validate, None
+                    (added, error_code, state_change_summary) = await self.blockchain.add_block(
+                        block, result_to_validate, bls_cache, fork_info
                     )
-
-                    if (
-                        self.full_node_store.previous_generator is not None
-                        and fork_height is not None
-                        and fork_height < self.full_node_store.previous_generator.block_height
-                    ):
-                        self.full_node_store.previous_generator = None
-
-                if added == ReceiveBlockResult.ALREADY_HAVE_BLOCK:
+                if added == AddBlockResult.ALREADY_HAVE_BLOCK:
                     return None
-                elif added == ReceiveBlockResult.INVALID_BLOCK:
+                elif added == AddBlockResult.INVALID_BLOCK:
                     assert error_code is not None
                     self.log.error(f"Block {header_hash} at height {block.height} is invalid with code {error_code}.")
-                    raise ConsensusError(error_code, header_hash)
-
-                elif added == ReceiveBlockResult.DISCONNECTED_BLOCK:
+                    raise ConsensusError(error_code, [header_hash])
+                elif added == AddBlockResult.DISCONNECTED_BLOCK:
                     self.log.info(f"Disconnected block {header_hash} at height {block.height}")
+                    if raise_on_disconnected:
+                        raise RuntimeError("Expected block to be added, received disconnected block.")
                     return None
-                elif added == ReceiveBlockResult.NEW_PEAK:
+                elif added == AddBlockResult.NEW_PEAK:
                     # Only propagate blocks which extend the blockchain (becomes one of the heads)
-                    new_peak: Optional[BlockRecord] = self.blockchain.get_peak()
-                    assert new_peak is not None and fork_height is not None
-                    mempool_new_peak_result, fns_peak_result = await self.peak_post_processing(
-                        block, new_peak, fork_height, peer, coin_changes[0]
-                    )
+                    assert state_change_summary is not None
+                    post_process_time = time.monotonic()
+                    ppp_result = await self.peak_post_processing(block, state_change_summary, peer)
+                    post_process_time = time.monotonic() - post_process_time
 
-                elif added == ReceiveBlockResult.ADDED_AS_ORPHAN:
+                elif added == AddBlockResult.ADDED_AS_ORPHAN:
                     self.log.info(
-                        f"Received orphan block of height {block.height} rh " f"{block.reward_chain_block.get_hash()}"
+                        f"Received orphan block of height {block.height} rh {block.reward_chain_block.get_hash()}"
                     )
+                    post_process_time = 0
                 else:
                     # Should never reach here, all the cases are covered
-                    raise RuntimeError(f"Invalid result from receive_block {added}")
+                    raise RuntimeError(f"Invalid result from add_block {added}")
             except asyncio.CancelledError:
                 # We need to make sure to always call this method even when we get a cancel exception, to make sure
                 # the node stays in sync
-                new_peak = self.blockchain.get_peak()
-                if added == ReceiveBlockResult.NEW_PEAK:
-                    assert new_peak is not None
-                    assert fork_height is not None
-                    await self.peak_post_processing(block, new_peak, fork_height, peer, coin_changes[0])
+                if added == AddBlockResult.NEW_PEAK:
+                    assert state_change_summary is not None
+                    await self.peak_post_processing(block, state_change_summary, peer)
                 raise
 
-            validation_time = time.time() - validation_start
+            validation_time = time.monotonic() - validation_start
 
-        if mempool_new_peak_result is not None:
-            assert new_peak is not None
-            assert fork_height is not None
-            assert fns_peak_result is not None
-            await self.peak_post_processing_2(
-                block, new_peak, fork_height, peer, coin_changes, mempool_new_peak_result, fns_peak_result
-            )
+        if ppp_result is not None:
+            assert state_change_summary is not None
+            await self.peak_post_processing_2(block, peer, state_change_summary, ppp_result)
 
         percent_full_str = (
             (
-                ", percent full: "
-                + str(round(100.0 * float(block.transactions_info.cost) / self.constants.MAX_BLOCK_COST_CLVM, 3))
-                + "%"
+                    ", percent full: "
+                    + str(round(100.0 * float(block.transactions_info.cost) / self.constants.MAX_BLOCK_COST_CLVM, 3))
+                    + "%"
             )
             if block.transactions_info is not None
             else ""
         )
         self.log.log(
             logging.WARNING if validation_time > 2 else logging.DEBUG,
-            f"Block validation time: {validation_time:0.2f} seconds, "
-            f"pre_validation time: {pre_validation_time:0.2f} seconds, "
+            f"Block validation: {validation_time:0.2f}s, "
+            f"pre_validation: {pre_validation_time:0.2f}s, "
+            f"CLVM: {pre_validation_results[0].timing / 1000.0:0.2f}s, "
+            f"post-process: {post_process_time:0.2f}s, "
             f"cost: {block.transactions_info.cost if block.transactions_info is not None else 'None'}"
-            f"{percent_full_str}",
+            f"{percent_full_str} header_hash: {header_hash.hex()} height: {block.height}",
         )
+
+        # this is not covered by any unit tests as it's essentially test code
+        # itself. It's exercised manually when investigating performance issues
+        if validation_time > 2 and pr is not None:  # pragma: no cover
+            pr.create_stats()
+            profile_dir = path_from_root(self.root_path, "block-validation-profile")
+            pr.dump_stats(profile_dir / f"{block.height}-{validation_time:0.1f}.profile")
 
         # This code path is reached if added == ADDED_AS_ORPHAN or NEW_TIP
         peak = self.blockchain.get_peak()
@@ -1530,33 +1850,61 @@ class FullNode:
         clear_height = uint32(max(0, peak.height - 50))
         self.full_node_store.clear_candidate_blocks_below(clear_height)
         self.full_node_store.clear_unfinished_blocks_below(clear_height)
-        if peak.height % 1000 == 0 and not self.sync_store.get_sync_mode():
-            await self.sync_store.clear_sync_info()  # Occasionally clear sync peer info
-        self._state_changed("block")
+
+        state_changed_data: Dict[str, Any] = {
+            "transaction_block": False,
+            "k_size": block.reward_chain_block.proof_of_space.size,
+            "header_hash": block.header_hash,
+            "fork_height": None,
+            "rolled_back_records": None,
+            "height": block.height,
+            "validation_time": validation_time,
+            "pre_validation_time": pre_validation_time,
+        }
+
+        if state_change_summary is not None:
+            state_changed_data["fork_height"] = state_change_summary.fork_height
+            state_changed_data["rolled_back_records"] = len(state_change_summary.rolled_back_records)
+
+        if block.transactions_info is not None:
+            state_changed_data["transaction_block"] = True
+            state_changed_data["block_cost"] = block.transactions_info.cost
+            state_changed_data["block_fees"] = block.transactions_info.fees
+
+        if block.foliage_transaction_block is not None:
+            state_changed_data["timestamp"] = block.foliage_transaction_block.timestamp
+
+        if block.transactions_generator is not None:
+            state_changed_data["transaction_generator_size_bytes"] = len(bytes(block.transactions_generator))
+
+        state_changed_data["transaction_generator_ref_list"] = block.transactions_generator_ref_list
+        if added is not None:
+            state_changed_data["receive_block_result"] = added.value
+
+        self._state_changed("block", state_changed_data)
+
         record = self.blockchain.block_record(block.header_hash)
         if self.weight_proof_handler is not None and record.sub_epoch_summary_included is not None:
             if self._segment_task is None or self._segment_task.done():
                 self._segment_task = asyncio.create_task(self.weight_proof_handler.create_prev_sub_epoch_segments())
         return None
 
-    async def respond_unfinished_block(
-        self,
-        respond_unfinished_block: full_node_protocol.RespondUnfinishedBlock,
-        peer: Optional[ws.WSChiaConnection],
-        farmed_block: bool = False,
-        block_bytes: Optional[bytes] = None,
-    ):
+    async def add_unfinished_block(
+            self,
+            block: UnfinishedBlock,
+            peer: Optional[WSGoldConnection],
+            farmed_block: bool = False,
+            block_bytes: Optional[bytes] = None,
+    ) -> None:
         """
         We have received an unfinished block, either created by us, or from another peer.
-        We can validate it and if it's a good block, propagate it to other peers and
+        We can validate and add it and if it's a good block, propagate it to other peers and
         timelords.
         """
-        self.log.info(f"[debug] respond_unfinished_block {farmed_block}")
-        block = respond_unfinished_block.unfinished_block
         receive_time = time.time()
 
         if block.prev_header_hash != self.constants.GENESIS_CHALLENGE and not self.blockchain.contains_block(
-            block.prev_header_hash
+                block.prev_header_hash
         ):
             # No need to request the parent, since the peer will send it to us anyway, via NewPeak
             self.log.debug("Received a disconnected unfinished block")
@@ -1569,11 +1917,12 @@ class FullNode:
         if self.full_node_store.seen_unfinished_block(block.get_hash()):
             return None
 
-        block_hash = block.reward_chain_block.get_hash()
+        block_hash = bytes32(block.reward_chain_block.get_hash())
+        foliage_tx_hash = block.foliage.foliage_transaction_block_hash
 
-        # This searched for the trunk hash (unfinished reward hash). If we have already added a block with the same
-        # hash, return
-        if self.full_node_store.get_unfinished_block(block_hash) is not None:
+        # If we have already added the block with this reward block hash and
+        # foliage hash, return
+        if self.full_node_store.get_unfinished_block2(block_hash, foliage_tx_hash)[0] is not None:
             return None
 
         peak: Optional[BlockRecord] = self.blockchain.get_peak()
@@ -1606,8 +1955,28 @@ class FullNode:
         # transactions to get validated
         npc_result: Optional[NPCResult] = None
         pre_validation_time = None
+
+        difficulty_coeff = await self.blockchain.get_farmer_difficulty_coeff(
+            block.reward_chain_block.proof_of_space.farmer_public_key,
+            uint32(prev_b.height if prev_b is not None and prev_b.height > 0 else 0),
+        )
+
+        async with self.blockchain.priority_mutex.acquire(priority=BlockchainMutexPriority.high):
+            start_header_time = time.monotonic()
+            _, header_error = await self.blockchain.validate_unfinished_block_header(block, difficulty_coeff)
+            if header_error is not None:
+                if header_error == Err.TIMESTAMP_TOO_FAR_IN_FUTURE:
+                    raise TimestampError()
+                else:
+                    raise ConsensusError(header_error)
+            validate_time = time.monotonic() - start_header_time
+            self.log.log(
+                logging.WARNING if validate_time > 2 else logging.DEBUG,
+                f"Time for header validate: {validate_time:0.3f}s",
+            )
+
         if block.transactions_generator is not None:
-            pre_validation_start = time.time()
+            pre_validation_start = time.monotonic()
             assert block.transactions_info is not None
             try:
                 block_generator: Optional[BlockGenerator] = await self.blockchain.get_block_generator(block)
@@ -1618,31 +1987,34 @@ class FullNode:
             if block_bytes is None:
                 block_bytes = bytes(block)
 
-            npc_result = await self.blockchain.run_generator(block_bytes, block_generator)
-            pre_validation_time = time.time() - pre_validation_start
+            height = uint32(0) if prev_b is None else uint32(prev_b.height + 1)
+            npc_result = await self.blockchain.run_generator(block_bytes, block_generator, height)
+            pre_validation_time = time.monotonic() - pre_validation_start
 
-            pairs_pks, pairs_msgs = pkm_pairs(npc_result.npc_list, self.constants.AGG_SIG_ME_ADDITIONAL_DATA)
-            if not cached_bls.aggregate_verify(
-                pairs_pks, pairs_msgs, block.transactions_info.aggregated_signature, True
+            # blockchain.run_generator throws on errors, so npc_result is
+            # guaranteed to represent a successful run
+            assert npc_result.conds is not None
+            pairs_pks, pairs_msgs = pkm_pairs(npc_result.conds, self.constants.AGG_SIG_ME_ADDITIONAL_DATA)
+            if not self._bls_cache.aggregate_verify(
+                    pairs_pks, pairs_msgs, block.transactions_info.aggregated_signature, True
             ):
                 raise ConsensusError(Err.BAD_AGGREGATE_SIGNATURE)
 
-        async with self._blockchain_lock_high_priority:
+        async with self.blockchain.priority_mutex.acquire(priority=BlockchainMutexPriority.high):
             # TODO: pre-validate VDFs outside of lock
-            validation_start = time.time()
-            validate_result = await self.blockchain.validate_unfinished_block(block, npc_result)
+            validation_start = time.monotonic()
+            validate_result = await self.blockchain.validate_unfinished_block(block, npc_result, difficulty_coeff)
             if validate_result.error is not None:
-                if validate_result.error == Err.COIN_AMOUNT_NEGATIVE.value:
-                    # TODO: remove in the future, hotfix for 1.1.5 peers to not disconnect older peers
-                    self.log.info(f"Consensus error {validate_result.error}, not disconnecting")
-                    return
                 raise ConsensusError(Err(validate_result.error))
-            validation_time = time.time() - validation_start
+            validation_time = time.monotonic() - validation_start
+
+        # respond_block will later use the cache (validated_signature=True)
+        validate_result = dataclasses.replace(validate_result, validated_signature=True)
 
         assert validate_result.required_iters is not None
 
         # Perform another check, in case we have already concurrently added the same unfinished block
-        if self.full_node_store.get_unfinished_block(block_hash) is not None:
+        if self.full_node_store.get_unfinished_block2(block_hash, foliage_tx_hash)[0] is not None:
             return None
 
         if block.prev_header_hash == self.constants.GENESIS_CHALLENGE:
@@ -1662,6 +2034,9 @@ class FullNode:
         pre_validation_log = (
             f"pre_validation time {pre_validation_time:0.4f}, " if pre_validation_time is not None else ""
         )
+        block_duration_in_seconds = (
+                receive_time - self.signage_point_times[block.reward_chain_block.signage_point_index]
+        )
         if farmed_block is True:
             self.log.info(
                 f"🍀 ️Farmed unfinished_block {block_hash}, SP: {block.reward_chain_block.signage_point_index}, "
@@ -1671,9 +2046,10 @@ class FullNode:
         else:
             percent_full_str = (
                 (
-                    ", percent full: "
-                    + str(round(100.0 * float(block.transactions_info.cost) / self.constants.MAX_BLOCK_COST_CLVM, 3))
-                    + "%"
+                        ", percent full: "
+                        + str(
+                    round(100.0 * float(block.transactions_info.cost) / self.constants.MAX_BLOCK_COST_CLVM, 3))
+                        + "%"
                 )
                 if block.transactions_info is not None
                 else ""
@@ -1681,7 +2057,7 @@ class FullNode:
             self.log.info(
                 f"Added unfinished_block {block_hash}, not farmed by us,"
                 f" SP: {block.reward_chain_block.signage_point_index} farmer response time: "
-                f"{receive_time - self.signage_point_times[block.reward_chain_block.signage_point_index]:0.4f}, "
+                f"{block_duration_in_seconds:0.4f}, "
                 f"Pool pk {encode_puzzle_hash(block.foliage.foliage_block_data.pool_target.puzzle_hash, 'gl')}, "
                 f"validation time: {validation_time:0.4f} seconds, {pre_validation_log}"
                 f"cost: {block.transactions_info.cost if block.transactions_info else 'None'}"
@@ -1709,7 +2085,6 @@ class FullNode:
             assert block.reward_chain_block.reward_chain_sp_vdf is not None
             rc_prev = block.reward_chain_block.reward_chain_sp_vdf.challenge
 
-        self.log.info("send timelord request NewUnfinishedBlockTimelord")
         timelord_request = timelord_protocol.NewUnfinishedBlockTimelord(
             block.reward_chain_block,
             difficulty,
@@ -1717,23 +2092,46 @@ class FullNode:
             block.foliage,
             ses,
             rc_prev,
-            validate_result.difficulty_coeff,
+            str(difficulty_coeff),
         )
 
         timelord_msg = make_msg(ProtocolMessageTypes.new_unfinished_block_timelord, timelord_request)
         await self.server.send_to_all([timelord_msg], NodeType.TIMELORD)
-        self.log.info("send timelord request NewUnfinishedBlockTimelord end")
 
+        # create two versions of the NewUnfinishedBlock message, one to be sent
+        # to newer clients and one for older clients
         full_node_request = full_node_protocol.NewUnfinishedBlock(block.reward_chain_block.get_hash())
         msg = make_msg(ProtocolMessageTypes.new_unfinished_block, full_node_request)
-        if peer is not None:
-            await self.server.send_to_all_except([msg], NodeType.FULL_NODE, peer.peer_node_id)
-        else:
-            await self.server.send_to_all([msg], NodeType.FULL_NODE)
-        self._state_changed("unfinished_block")
+
+        full_node_request2 = full_node_protocol.NewUnfinishedBlock2(
+            block.reward_chain_block.get_hash(), block.foliage.foliage_transaction_block_hash
+        )
+        msg2 = make_msg(ProtocolMessageTypes.new_unfinished_block2, full_node_request2)
+
+        def old_clients(conn: WSGoldConnection) -> bool:
+            # don't send this to peers with new clients
+            return conn.protocol_version <= Version("0.0.35")
+
+        def new_clients(conn: WSGoldConnection) -> bool:
+            # don't send this to peers with old clients
+            return conn.protocol_version > Version("0.0.35")
+
+        peer_id: Optional[bytes32] = None if peer is None else peer.peer_node_id
+        await self.server.send_to_all_if([msg], NodeType.FULL_NODE, old_clients, peer_id)
+        await self.server.send_to_all_if([msg2], NodeType.FULL_NODE, new_clients, peer_id)
+
+        self._state_changed(
+            "unfinished_block",
+            {
+                "block_duration_in_seconds": block_duration_in_seconds,
+                "validation_time_in_seconds": validation_time,
+                "pre_validation_time_in_seconds": pre_validation_time,
+                "unfinished_block": block.to_json_dict(),
+            },
+        )
 
     async def new_infusion_point_vdf(
-        self, request: timelord_protocol.NewInfusionPointVDF, timelord_peer: Optional[ws.WSChiaConnection] = None
+            self, request: timelord_protocol.NewInfusionPointVDF, timelord_peer: Optional[WSGoldConnection] = None
     ) -> Optional[Message]:
         # Lookup unfinished blocks
         unfinished_block: Optional[UnfinishedBlock] = self.full_node_store.get_unfinished_block(
@@ -1774,7 +2172,9 @@ class FullNode:
             # If not found, cache keyed on prev block
             if prev_b is None:
                 self.full_node_store.add_to_future_ip(request)
-                self.log.warning(f"Previous block is None, infusion point {request.reward_chain_ip_vdf.challenge}")
+                self.log.warning(
+                    f"Previous block is None, infusion point {request.reward_chain_ip_vdf.challenge.hex()}"
+                )
                 return None
 
         finished_sub_slots: Optional[List[EndOfSubSlotBundle]] = self.full_node_store.get_finished_sub_slots(
@@ -1827,19 +2227,18 @@ class FullNode:
             self.log.warning("Trying to make a pre-farm block but height is not 0")
             return None
         try:
-            await self.respond_block(full_node_protocol.RespondBlock(block))
+            await self.add_block(block, None, self._bls_cache, raise_on_disconnected=True)
         except Exception as e:
-            self.log.exception(f"Consensus error validating block: {e}")
+            self.log.warning(f"Consensus error validating block: {e}")
             if timelord_peer is not None:
                 # Only sends to the timelord who sent us this VDF, to reset them to the correct peak
                 await self.send_peak_to_timelords(peer=timelord_peer)
         return None
 
-    async def respond_end_of_sub_slot(
-        self, request: full_node_protocol.RespondEndOfSubSlot, peer: ws.WSChiaConnection
+    async def add_end_of_sub_slot(
+            self, end_of_slot_bundle: EndOfSubSlotBundle, peer: WSGoldConnection
     ) -> Tuple[Optional[Message], bool]:
-
-        fetched_ss = self.full_node_store.get_sub_slot(request.end_of_slot_bundle.challenge_chain.get_hash())
+        fetched_ss = self.full_node_store.get_sub_slot(end_of_slot_bundle.challenge_chain.get_hash())
 
         # We are not interested in sub-slots which have the same challenge chain but different reward chain. If there
         # is a reorg, we will find out through the broadcast of blocks instead.
@@ -1849,18 +2248,18 @@ class FullNode:
 
         async with self.timelord_lock:
             fetched_ss = self.full_node_store.get_sub_slot(
-                request.end_of_slot_bundle.challenge_chain.challenge_chain_end_of_slot_vdf.challenge
+                end_of_slot_bundle.challenge_chain.challenge_chain_end_of_slot_vdf.challenge
             )
             if (
-                (fetched_ss is None)
-                and request.end_of_slot_bundle.challenge_chain.challenge_chain_end_of_slot_vdf.challenge
-                != self.constants.GENESIS_CHALLENGE
+                    (fetched_ss is None)
+                    and end_of_slot_bundle.challenge_chain.challenge_chain_end_of_slot_vdf.challenge
+                    != self.constants.GENESIS_CHALLENGE
             ):
                 # If we don't have the prev, request the prev instead
                 full_node_request = full_node_protocol.RequestSignagePointOrEndOfSubSlot(
-                    request.end_of_slot_bundle.challenge_chain.challenge_chain_end_of_slot_vdf.challenge,
+                    end_of_slot_bundle.challenge_chain.challenge_chain_end_of_slot_vdf.challenge,
                     uint8(0),
-                    bytes([0] * 32),
+                    bytes32([0] * 32),
                 )
                 return (
                     make_msg(ProtocolMessageTypes.request_signage_point_or_end_of_sub_slot, full_node_request),
@@ -1877,41 +2276,51 @@ class FullNode:
 
             # Adds the sub slot and potentially get new infusions
             new_infusions = self.full_node_store.new_finished_sub_slot(
-                request.end_of_slot_bundle,
+                end_of_slot_bundle,
                 self.blockchain,
                 peak,
+                next_sub_slot_iters,
+                next_difficulty,
                 await self.blockchain.get_full_peak(),
             )
             # It may be an empty list, even if it's not None. Not None means added successfully
             if new_infusions is not None:
                 self.log.info(
                     f"⏲️  Finished sub slot, SP {self.constants.NUM_SPS_SUB_SLOT}/{self.constants.NUM_SPS_SUB_SLOT}, "
-                    f"{request.end_of_slot_bundle.challenge_chain.get_hash()}, "
+                    f"{end_of_slot_bundle.challenge_chain.get_hash().hex()}, "
                     f"number of sub-slots: {len(self.full_node_store.finished_sub_slots)}, "
-                    f"RC hash: {request.end_of_slot_bundle.reward_chain.get_hash()}, "
-                    f"Deficit {request.end_of_slot_bundle.reward_chain.deficit}"
+                    f"RC hash: {end_of_slot_bundle.reward_chain.get_hash().hex()}, "
+                    f"Deficit {end_of_slot_bundle.reward_chain.deficit}"
                 )
+                # Reset farmer response timer for sub slot (SP 0)
+                self.signage_point_times[0] = time.time()
                 # Notify full nodes of the new sub-slot
                 broadcast = full_node_protocol.NewSignagePointOrEndOfSubSlot(
-                    request.end_of_slot_bundle.challenge_chain.challenge_chain_end_of_slot_vdf.challenge,
-                    request.end_of_slot_bundle.challenge_chain.get_hash(),
+                    end_of_slot_bundle.challenge_chain.challenge_chain_end_of_slot_vdf.challenge,
+                    end_of_slot_bundle.challenge_chain.get_hash(),
                     uint8(0),
-                    request.end_of_slot_bundle.reward_chain.end_of_slot_vdf.challenge,
+                    end_of_slot_bundle.reward_chain.end_of_slot_vdf.challenge,
                 )
                 msg = make_msg(ProtocolMessageTypes.new_signage_point_or_end_of_sub_slot, broadcast)
-                await self.server.send_to_all_except([msg], NodeType.FULL_NODE, peer.peer_node_id)
+                await self.server.send_to_all([msg], NodeType.FULL_NODE, peer.peer_node_id)
 
                 for infusion in new_infusions:
                     await self.new_infusion_point_vdf(infusion)
 
                 # Notify farmers of the new sub-slot
                 broadcast_farmer = farmer_protocol.NewSignagePoint(
-                    request.end_of_slot_bundle.challenge_chain.get_hash(),
-                    request.end_of_slot_bundle.challenge_chain.get_hash(),
-                    request.end_of_slot_bundle.reward_chain.get_hash(),
+                    end_of_slot_bundle.challenge_chain.get_hash(),
+                    end_of_slot_bundle.challenge_chain.get_hash(),
+                    end_of_slot_bundle.reward_chain.get_hash(),
                     next_difficulty,
                     next_sub_slot_iters,
                     uint8(0),
+                    uint32(0) if peak is None else peak.height,
+                    sp_source_data=SignagePointSourceData(
+                        sub_slot_data=SPSubSlotSourceData(
+                            end_of_slot_bundle.challenge_chain, end_of_slot_bundle.reward_chain
+                        )
+                    ),
                 )
                 msg = make_msg(ProtocolMessageTypes.new_signage_point, broadcast_farmer)
                 await self.server.send_to_all([msg], NodeType.FARMER)
@@ -1919,100 +2328,220 @@ class FullNode:
             else:
                 self.log.info(
                     f"End of slot not added CC challenge "
-                    f"{request.end_of_slot_bundle.challenge_chain.challenge_chain_end_of_slot_vdf.challenge}"
+                    f"{end_of_slot_bundle.challenge_chain.challenge_chain_end_of_slot_vdf.challenge.hex()}"
                 )
         return None, False
 
-    async def respond_transaction(
-        self,
-        transaction: SpendBundle,
-        spend_name: bytes32,
-        peer: Optional[ws.WSChiaConnection] = None,
-        test: bool = False,
-        tx_bytes: Optional[bytes] = None,
+    async def add_transaction(
+            self,
+            transaction: SpendBundle,
+            spend_name: bytes32,
+            peer: Optional[WSGoldConnection] = None,
+            test: bool = False,
+            tx_bytes: Optional[bytes] = None,
     ) -> Tuple[MempoolInclusionStatus, Optional[Err]]:
         if self.sync_store.get_sync_mode():
             return MempoolInclusionStatus.FAILED, Err.NO_TRANSACTIONS_WHILE_SYNCING
         if not test and not (await self.synced()):
             return MempoolInclusionStatus.FAILED, Err.NO_TRANSACTIONS_WHILE_SYNCING
 
+        if self.mempool_manager.get_spendbundle(spend_name) is not None:
+            self.mempool_manager.remove_seen(spend_name)
+            return MempoolInclusionStatus.SUCCESS, None
         if self.mempool_manager.seen(spend_name):
             return MempoolInclusionStatus.FAILED, Err.ALREADY_INCLUDING_TRANSACTION
         self.mempool_manager.add_and_maybe_pop_seen(spend_name)
         self.log.debug(f"Processing transaction: {spend_name}")
-        # Ignore if syncing
-        if self.sync_store.get_sync_mode():
+        # Ignore if syncing or if we have not yet received a block
+        # the mempool must have a peak to validate transactions
+        if self.sync_store.get_sync_mode() or self.mempool_manager.peak is None:
             status = MempoolInclusionStatus.FAILED
             error: Optional[Err] = Err.NO_TRANSACTIONS_WHILE_SYNCING
             self.mempool_manager.remove_seen(spend_name)
         else:
             try:
-                cost_result = await self.mempool_manager.pre_validate_spendbundle(transaction, tx_bytes, spend_name)
+                cost_result = await self.mempool_manager.pre_validate_spendbundle(
+                    transaction, tx_bytes, spend_name, self._bls_cache
+                )
             except ValidationError as e:
                 self.mempool_manager.remove_seen(spend_name)
                 return MempoolInclusionStatus.FAILED, e.code
-            except Exception as e:
+            except Exception:
                 self.mempool_manager.remove_seen(spend_name)
-                raise e
-            async with self._blockchain_lock_low_priority:
+                raise
+            async with self.blockchain.priority_mutex.acquire(priority=BlockchainMutexPriority.low):
                 if self.mempool_manager.get_spendbundle(spend_name) is not None:
                     self.mempool_manager.remove_seen(spend_name)
-                    return MempoolInclusionStatus.FAILED, Err.ALREADY_INCLUDING_TRANSACTION
-                cost, status, error = await self.mempool_manager.add_spendbundle(transaction, cost_result, spend_name)
+                    return MempoolInclusionStatus.SUCCESS, None
+                if self.mempool_manager.peak is None:
+                    return MempoolInclusionStatus.FAILED, Err.MEMPOOL_NOT_INITIALIZED
+                info = await self.mempool_manager.add_spend_bundle(
+                    transaction, cost_result, spend_name, self.mempool_manager.peak.height
+                )
+                status = info.status
+                error = info.error
             if status == MempoolInclusionStatus.SUCCESS:
                 self.log.debug(
                     f"Added transaction to mempool: {spend_name} mempool size: "
-                    f"{self.mempool_manager.mempool.total_mempool_cost} normalized "
-                    f"{self.mempool_manager.mempool.total_mempool_cost / 5000000}"
+                    f"{self.mempool_manager.mempool.total_mempool_cost()} normalized "
+                    f"{self.mempool_manager.mempool.total_mempool_cost() / 5000000}"
                 )
 
                 # Only broadcast successful transactions, not pending ones. Otherwise it's a DOS
                 # vector.
                 mempool_item = self.mempool_manager.get_mempool_item(spend_name)
                 assert mempool_item is not None
-                fees = mempool_item.fee
-                assert fees >= 0
-                assert cost is not None
-                new_tx = full_node_protocol.NewTransaction(
-                    spend_name,
-                    cost,
-                    fees,
-                )
-                msg = make_msg(ProtocolMessageTypes.new_transaction, new_tx)
-                if peer is None:
-                    await self.server.send_to_all([msg], NodeType.FULL_NODE)
-                else:
-                    await self.server.send_to_all_except([msg], NodeType.FULL_NODE, peer.peer_node_id)
-                self.not_dropped_tx += 1
+                await self.broadcast_removed_tx(info.removals)
+                await self.broadcast_added_tx(mempool_item, current_peer=peer)
+
+                if self.simulator_transaction_callback is not None:  # callback
+                    await self.simulator_transaction_callback(spend_name)  # pylint: disable=E1102
+
             else:
                 self.mempool_manager.remove_seen(spend_name)
-                self.log.debug(
-                    f"Wasn't able to add transaction with id {spend_name}, " f"status {status} error: {error}"
-                )
+                self.log.debug(f"Wasn't able to add transaction with id {spend_name}, status {status} error: {error}")
         return status, error
 
+    async def broadcast_added_tx(
+            self, mempool_item: MempoolItem, current_peer: Optional[WSGoldConnection] = None
+    ) -> None:
+        assert mempool_item.fee >= 0
+        assert mempool_item.cost is not None
+
+        new_tx = full_node_protocol.NewTransaction(
+            mempool_item.name,
+            mempool_item.cost,
+            mempool_item.fee,
+        )
+        msg = make_msg(ProtocolMessageTypes.new_transaction, new_tx)
+        if current_peer is None:
+            await self.server.send_to_all([msg], NodeType.FULL_NODE)
+        else:
+            await self.server.send_to_all([msg], NodeType.FULL_NODE, current_peer.peer_node_id)
+
+        conds = mempool_item.npc_result.conds
+        assert conds is not None
+
+        all_peers = {
+            peer_id
+            for peer_id, peer in self.server.all_connections.items()
+            if peer.has_capability(Capability.MEMPOOL_UPDATES)
+        }
+
+        if len(all_peers) == 0:
+            return
+
+        start_time = time.monotonic()
+
+        hints_for_removals = await self.hint_store.get_hints([bytes32(spend.coin_id) for spend in conds.spends])
+        peer_ids = all_peers.intersection(peers_for_spend_bundle(self.subscriptions, conds, set(hints_for_removals)))
+
+        for peer_id in peer_ids:
+            peer = self.server.all_connections.get(peer_id)
+
+            if peer is None:
+                continue
+
+            msg = make_msg(
+                ProtocolMessageTypes.mempool_items_added, wallet_protocol.MempoolItemsAdded([mempool_item.name])
+            )
+            await peer.send_message(msg)
+
+        total_time = time.monotonic() - start_time
+
+        self.log.log(
+            logging.DEBUG if total_time < 0.5 else logging.WARNING,
+            f"Broadcasting added transaction {mempool_item.name} to {len(peer_ids)} peers took {total_time:.4f}s",
+        )
+
+    async def broadcast_removed_tx(self, mempool_removals: List[MempoolRemoveInfo]) -> None:
+        total_removals = sum([len(r.items) for r in mempool_removals])
+        if total_removals == 0:
+            return
+
+        start_time = time.monotonic()
+
+        self.log.debug(f"Broadcasting {total_removals} removed transactions to peers")
+
+        all_peers = {
+            peer_id
+            for peer_id, peer in self.server.all_connections.items()
+            if peer.has_capability(Capability.MEMPOOL_UPDATES)
+        }
+
+        if len(all_peers) == 0:
+            return
+
+        removals_to_send: Dict[bytes32, List[RemovedMempoolItem]] = dict()
+
+        for removal_info in mempool_removals:
+            for internal_mempool_item in removal_info.items:
+                conds = internal_mempool_item.npc_result.conds
+                assert conds is not None
+
+                hints_for_removals = await self.hint_store.get_hints([bytes32(spend.coin_id) for spend in conds.spends])
+                peer_ids = all_peers.intersection(
+                    peers_for_spend_bundle(self.subscriptions, conds, set(hints_for_removals))
+                )
+
+                if len(peer_ids) == 0:
+                    continue
+
+                transaction_id = internal_mempool_item.spend_bundle.name()
+
+                self.log.debug(f"Broadcasting removed transaction {transaction_id} to " f"wallet peers {peer_ids}")
+
+                for peer_id in peer_ids:
+                    peer = self.server.all_connections.get(peer_id)
+
+                    if peer is None:
+                        continue
+
+                    removal = wallet_protocol.RemovedMempoolItem(transaction_id, uint8(removal_info.reason.value))
+                    removals_to_send.setdefault(peer.peer_node_id, []).append(removal)
+
+        for peer_id, removals in removals_to_send.items():
+            peer = self.server.all_connections.get(peer_id)
+
+            if peer is None:
+                continue
+
+            msg = make_msg(
+                ProtocolMessageTypes.mempool_items_removed,
+                wallet_protocol.MempoolItemsRemoved(removals),
+            )
+            await peer.send_message(msg)
+
+        total_time = time.monotonic() - start_time
+
+        self.log.log(
+            logging.DEBUG if total_time < 0.5 else logging.WARNING,
+            f"Broadcasting {total_removals} removed transactions "
+            f"to {len(removals_to_send)} peers took {total_time:.4f}s",
+        )
+
     async def _needs_compact_proof(
-        self, vdf_info: VDFInfo, header_block: HeaderBlock, field_vdf: CompressibleVDFField
+            self, vdf_info: VDFInfo, header_block: HeaderBlock, field_vdf: CompressibleVDFField
     ) -> bool:
         if field_vdf == CompressibleVDFField.CC_EOS_VDF:
             for sub_slot in header_block.finished_sub_slots:
                 if sub_slot.challenge_chain.challenge_chain_end_of_slot_vdf == vdf_info:
                     if (
-                        sub_slot.proofs.challenge_chain_slot_proof.witness_type == 0
-                        and sub_slot.proofs.challenge_chain_slot_proof.normalized_to_identity
+                            sub_slot.proofs.challenge_chain_slot_proof.witness_type == 0
+                            and sub_slot.proofs.challenge_chain_slot_proof.normalized_to_identity
                     ):
                         return False
                     return True
         if field_vdf == CompressibleVDFField.ICC_EOS_VDF:
             for sub_slot in header_block.finished_sub_slots:
                 if (
-                    sub_slot.infused_challenge_chain is not None
-                    and sub_slot.infused_challenge_chain.infused_challenge_chain_end_of_slot_vdf == vdf_info
+                        sub_slot.infused_challenge_chain is not None
+                        and sub_slot.infused_challenge_chain.infused_challenge_chain_end_of_slot_vdf == vdf_info
                 ):
                     assert sub_slot.proofs.infused_challenge_chain_slot_proof is not None
                     if (
-                        sub_slot.proofs.infused_challenge_chain_slot_proof.witness_type == 0
-                        and sub_slot.proofs.infused_challenge_chain_slot_proof.normalized_to_identity
+                            sub_slot.proofs.infused_challenge_chain_slot_proof.witness_type == 0
+                            and sub_slot.proofs.infused_challenge_chain_slot_proof.normalized_to_identity
                     ):
                         return False
                     return True
@@ -2022,28 +2551,28 @@ class FullNode:
             if vdf_info == header_block.reward_chain_block.challenge_chain_sp_vdf:
                 assert header_block.challenge_chain_sp_proof is not None
                 if (
-                    header_block.challenge_chain_sp_proof.witness_type == 0
-                    and header_block.challenge_chain_sp_proof.normalized_to_identity
+                        header_block.challenge_chain_sp_proof.witness_type == 0
+                        and header_block.challenge_chain_sp_proof.normalized_to_identity
                 ):
                     return False
                 return True
         if field_vdf == CompressibleVDFField.CC_IP_VDF:
             if vdf_info == header_block.reward_chain_block.challenge_chain_ip_vdf:
                 if (
-                    header_block.challenge_chain_ip_proof.witness_type == 0
-                    and header_block.challenge_chain_ip_proof.normalized_to_identity
+                        header_block.challenge_chain_ip_proof.witness_type == 0
+                        and header_block.challenge_chain_ip_proof.normalized_to_identity
                 ):
                     return False
                 return True
         return False
 
     async def _can_accept_compact_proof(
-        self,
-        vdf_info: VDFInfo,
-        vdf_proof: VDFProof,
-        height: uint32,
-        header_hash: bytes32,
-        field_vdf: CompressibleVDFField,
+            self,
+            vdf_info: VDFInfo,
+            vdf_proof: VDFProof,
+            height: uint32,
+            header_hash: bytes32,
+            field_vdf: CompressibleVDFField,
     ) -> bool:
         """
         - Checks if the provided proof is indeed compact.
@@ -2055,10 +2584,14 @@ class FullNode:
         if is_fully_compactified is None or is_fully_compactified:
             self.log.info(f"Already compactified block: {header_hash}. Ignoring.")
             return False
+        peak = self.blockchain.get_peak()
+        if peak is None or peak.height - height < 5:
+            self.log.debug("Will not compactify recent block")
+            return False
         if vdf_proof.witness_type > 0 or not vdf_proof.normalized_to_identity:
             self.log.error(f"Received vdf proof is not compact: {vdf_proof}.")
             return False
-        if not vdf_proof.is_valid(self.constants, ClassgroupElement.get_default_element(), vdf_info):
+        if not validate_vdf(vdf_proof, self.constants, ClassgroupElement.get_default_element(), vdf_info):
             self.log.error(f"Received compact vdf proof is not valid: {vdf_proof}.")
             return False
         header_block = await self.blockchain.get_header_block_by_height(height, header_hash, tx_filter=False)
@@ -2070,68 +2603,74 @@ class FullNode:
             self.log.info(f"Duplicate compact proof. Height: {height}. Header hash: {header_hash}.")
         return is_new_proof
 
+    # returns True if we ended up replacing the proof, and False otherwise
     async def _replace_proof(
-        self,
-        vdf_info: VDFInfo,
-        vdf_proof: VDFProof,
-        height: uint32,
-        field_vdf: CompressibleVDFField,
+            self,
+            vdf_info: VDFInfo,
+            vdf_proof: VDFProof,
+            header_hash: bytes32,
+            field_vdf: CompressibleVDFField,
     ) -> bool:
-        full_blocks = await self.block_store.get_full_blocks_at([height])
-        assert len(full_blocks) > 0
-        replaced = False
-        expected_header_hash = self.blockchain.height_to_hash(height)
-        for block in full_blocks:
-            new_block = None
-            if block.header_hash != expected_header_hash:
-                continue
-            block_record = await self.blockchain.get_block_record_from_db(expected_header_hash)
-            assert block_record is not None
+        block = await self.block_store.get_full_block(header_hash)
+        if block is None:
+            return False
 
-            if field_vdf == CompressibleVDFField.CC_EOS_VDF:
-                for index, sub_slot in enumerate(block.finished_sub_slots):
-                    if sub_slot.challenge_chain.challenge_chain_end_of_slot_vdf == vdf_info:
-                        new_proofs = dataclasses.replace(sub_slot.proofs, challenge_chain_slot_proof=vdf_proof)
-                        new_subslot = dataclasses.replace(sub_slot, proofs=new_proofs)
-                        new_finished_subslots = block.finished_sub_slots
-                        new_finished_subslots[index] = new_subslot
-                        new_block = dataclasses.replace(block, finished_sub_slots=new_finished_subslots)
-                        break
-            if field_vdf == CompressibleVDFField.ICC_EOS_VDF:
-                for index, sub_slot in enumerate(block.finished_sub_slots):
-                    if (
+        new_block = None
+
+        if field_vdf == CompressibleVDFField.CC_EOS_VDF:
+            for index, sub_slot in enumerate(block.finished_sub_slots):
+                if sub_slot.challenge_chain.challenge_chain_end_of_slot_vdf == vdf_info:
+                    new_proofs = sub_slot.proofs.replace(challenge_chain_slot_proof=vdf_proof)
+                    new_subslot = sub_slot.replace(proofs=new_proofs)
+                    new_finished_subslots = block.finished_sub_slots
+                    new_finished_subslots[index] = new_subslot
+                    new_block = block.replace(finished_sub_slots=new_finished_subslots)
+                    break
+        if field_vdf == CompressibleVDFField.ICC_EOS_VDF:
+            for index, sub_slot in enumerate(block.finished_sub_slots):
+                if (
                         sub_slot.infused_challenge_chain is not None
                         and sub_slot.infused_challenge_chain.infused_challenge_chain_end_of_slot_vdf == vdf_info
-                    ):
-                        new_proofs = dataclasses.replace(sub_slot.proofs, infused_challenge_chain_slot_proof=vdf_proof)
-                        new_subslot = dataclasses.replace(sub_slot, proofs=new_proofs)
-                        new_finished_subslots = block.finished_sub_slots
-                        new_finished_subslots[index] = new_subslot
-                        new_block = dataclasses.replace(block, finished_sub_slots=new_finished_subslots)
-                        break
-            if field_vdf == CompressibleVDFField.CC_SP_VDF:
-                if block.reward_chain_block.challenge_chain_sp_vdf == vdf_info:
-                    assert block.challenge_chain_sp_proof is not None
-                    new_block = dataclasses.replace(block, challenge_chain_sp_proof=vdf_proof)
-            if field_vdf == CompressibleVDFField.CC_IP_VDF:
-                if block.reward_chain_block.challenge_chain_ip_vdf == vdf_info:
-                    new_block = dataclasses.replace(block, challenge_chain_ip_proof=vdf_proof)
-            if new_block is None:
-                continue
-            async with self.db_wrapper.lock:
-                await self.block_store.add_full_block(new_block.header_hash, new_block, block_record)
-                await self.block_store.db_wrapper.commit_transaction()
-                replaced = True
-        return replaced
+                ):
+                    new_proofs = sub_slot.proofs.replace(infused_challenge_chain_slot_proof=vdf_proof)
+                    new_subslot = sub_slot.replace(proofs=new_proofs)
+                    new_finished_subslots = block.finished_sub_slots
+                    new_finished_subslots[index] = new_subslot
+                    new_block = block.replace(finished_sub_slots=new_finished_subslots)
+                    break
+        if field_vdf == CompressibleVDFField.CC_SP_VDF:
+            if block.reward_chain_block.challenge_chain_sp_vdf == vdf_info:
+                assert block.challenge_chain_sp_proof is not None
+                new_block = block.replace(challenge_chain_sp_proof=vdf_proof)
+        if field_vdf == CompressibleVDFField.CC_IP_VDF:
+            if block.reward_chain_block.challenge_chain_ip_vdf == vdf_info:
+                new_block = block.replace(challenge_chain_ip_proof=vdf_proof)
+        if new_block is None:
+            return False
+        async with self.db_wrapper.writer():
+            try:
+                await self.block_store.replace_proof(header_hash, new_block)
+                return True
+            except BaseException as e:
+                self.log.error(
+                    f"_replace_proof error while adding block {block.header_hash} height {block.height},"
+                    f" rolling back: {e} {traceback.format_exc()}"
+                )
+                raise
 
-    async def respond_compact_proof_of_time(self, request: timelord_protocol.RespondCompactProofOfTime):
+    async def add_compact_proof_of_time(self, request: timelord_protocol.RespondCompactProofOfTime) -> None:
+        peak = self.blockchain.get_peak()
+        if peak is None or peak.height - request.height < 5:
+            self.log.info(f"Ignoring add_compact_proof_of_time, height {request.height} too recent.")
+            return None
+
         field_vdf = CompressibleVDFField(int(request.field_vdf))
         if not await self._can_accept_compact_proof(
-            request.vdf_info, request.vdf_proof, request.height, request.header_hash, field_vdf
+                request.vdf_info, request.vdf_proof, request.height, request.header_hash, field_vdf
         ):
             return None
         async with self.blockchain.compact_proof_lock:
-            replaced = await self._replace_proof(request.vdf_info, request.vdf_proof, request.height, field_vdf)
+            replaced = await self._replace_proof(request.vdf_info, request.vdf_proof, request.header_hash, field_vdf)
         if not replaced:
             self.log.error(f"Could not replace compact proof: {request.height}")
             return None
@@ -2140,13 +2679,17 @@ class FullNode:
             ProtocolMessageTypes.new_compact_vdf,
             full_node_protocol.NewCompactVDF(request.height, request.header_hash, request.field_vdf, request.vdf_info),
         )
-        if self.server is not None:
+        if self._server is not None:
             await self.server.send_to_all([msg], NodeType.FULL_NODE)
 
-    async def new_compact_vdf(self, request: full_node_protocol.NewCompactVDF, peer: ws.WSChiaConnection):
+    async def new_compact_vdf(self, request: full_node_protocol.NewCompactVDF, peer: WSGoldConnection) -> None:
+        peak = self.blockchain.get_peak()
+        if peak is None or peak.height - request.height < 5:
+            self.log.info(f"Ignoring new_compact_vdf, height {request.height} too recent.")
+            return None
         is_fully_compactified = await self.block_store.is_fully_compactified(request.header_hash)
         if is_fully_compactified is None or is_fully_compactified:
-            return False
+            return None
         header_block = await self.blockchain.get_header_block_by_height(
             request.height, request.header_hash, tx_filter=False
         )
@@ -2157,11 +2700,11 @@ class FullNode:
             peer_request = full_node_protocol.RequestCompactVDF(
                 request.height, request.header_hash, request.field_vdf, request.vdf_info
             )
-            response = await peer.request_compact_vdf(peer_request, timeout=10)
+            response = await peer.call_api(FullNodeAPI.request_compact_vdf, peer_request, timeout=10)
             if response is not None and isinstance(response, full_node_protocol.RespondCompactVDF):
-                await self.respond_compact_vdf(response, peer)
+                await self.add_compact_vdf(response, peer)
 
-    async def request_compact_vdf(self, request: full_node_protocol.RequestCompactVDF, peer: ws.WSChiaConnection):
+    async def request_compact_vdf(self, request: full_node_protocol.RequestCompactVDF, peer: WSGoldConnection) -> None:
         header_block = await self.blockchain.get_header_block_by_height(
             request.height, request.header_hash, tx_filter=False
         )
@@ -2177,19 +2720,19 @@ class FullNode:
         if field_vdf == CompressibleVDFField.ICC_EOS_VDF:
             for sub_slot in header_block.finished_sub_slots:
                 if (
-                    sub_slot.infused_challenge_chain is not None
-                    and sub_slot.infused_challenge_chain.infused_challenge_chain_end_of_slot_vdf == request.vdf_info
+                        sub_slot.infused_challenge_chain is not None
+                        and sub_slot.infused_challenge_chain.infused_challenge_chain_end_of_slot_vdf == request.vdf_info
                 ):
                     vdf_proof = sub_slot.proofs.infused_challenge_chain_slot_proof
                     break
         if (
-            field_vdf == CompressibleVDFField.CC_SP_VDF
-            and header_block.reward_chain_block.challenge_chain_sp_vdf == request.vdf_info
+                field_vdf == CompressibleVDFField.CC_SP_VDF
+                and header_block.reward_chain_block.challenge_chain_sp_vdf == request.vdf_info
         ):
             vdf_proof = header_block.challenge_chain_sp_proof
         if (
-            field_vdf == CompressibleVDFField.CC_IP_VDF
-            and header_block.reward_chain_block.challenge_chain_ip_vdf == request.vdf_info
+                field_vdf == CompressibleVDFField.CC_IP_VDF
+                and header_block.reward_chain_block.challenge_chain_ip_vdf == request.vdf_info
         ):
             vdf_proof = header_block.challenge_chain_ip_proof
         if vdf_proof is None or vdf_proof.witness_type > 0 or not vdf_proof.normalized_to_identity:
@@ -2205,16 +2748,16 @@ class FullNode:
         msg = make_msg(ProtocolMessageTypes.respond_compact_vdf, compact_vdf)
         await peer.send_message(msg)
 
-    async def respond_compact_vdf(self, request: full_node_protocol.RespondCompactVDF, peer: ws.WSChiaConnection):
+    async def add_compact_vdf(self, request: full_node_protocol.RespondCompactVDF, peer: WSGoldConnection) -> None:
         field_vdf = CompressibleVDFField(int(request.field_vdf))
         if not await self._can_accept_compact_proof(
-            request.vdf_info, request.vdf_proof, request.height, request.header_hash, field_vdf
+                request.vdf_info, request.vdf_proof, request.height, request.header_hash, field_vdf
         ):
             return None
         async with self.blockchain.compact_proof_lock:
             if self.blockchain.seen_compact_proofs(request.vdf_info, request.height):
                 return None
-            replaced = await self._replace_proof(request.vdf_info, request.vdf_proof, request.height, field_vdf)
+            replaced = await self._replace_proof(request.vdf_info, request.vdf_proof, request.header_hash, field_vdf)
         if not replaced:
             self.log.error(f"Could not replace compact proof: {request.height}")
             return None
@@ -2222,15 +2765,50 @@ class FullNode:
             ProtocolMessageTypes.new_compact_vdf,
             full_node_protocol.NewCompactVDF(request.height, request.header_hash, request.field_vdf, request.vdf_info),
         )
-        if self.server is not None:
-            await self.server.send_to_all_except([msg], NodeType.FULL_NODE, peer.peer_node_id)
+        if self._server is not None:
+            await self.server.send_to_all([msg], NodeType.FULL_NODE, peer.peer_node_id)
+
+    def in_bad_peak_cache(self, wp: WeightProof) -> bool:
+        for block in wp.recent_chain_data:
+            if block.header_hash in self.bad_peak_cache.keys():
+                return True
+        return False
+
+    def add_to_bad_peak_cache(self, peak_header_hash: bytes32, peak_height: uint32) -> None:
+        curr_height = self.blockchain.get_peak_height()
+
+        if curr_height is None:
+            self.log.debug(f"add bad peak {peak_header_hash} to cache")
+            self.bad_peak_cache[peak_header_hash] = peak_height
+            return
+        minimum_cache_height = curr_height - (2 * self.constants.SUB_EPOCH_BLOCKS)
+        if peak_height < minimum_cache_height:
+            return
+
+        new_cache = {}
+        self.log.info(f"add bad peak {peak_header_hash} to cache")
+        new_cache[peak_header_hash] = peak_height
+        min_height = peak_height
+        min_block = peak_header_hash
+        for header_hash, height in self.bad_peak_cache.items():
+            if height < minimum_cache_height:
+                self.log.debug(f"remove bad peak {peak_header_hash} from cache")
+                continue
+            if height < min_height:
+                min_block = header_hash
+            new_cache[header_hash] = height
+
+        if len(new_cache) > self.config.get("bad_peak_cache_size", 100):
+            del new_cache[min_block]
+
+        self.bad_peak_cache = new_cache
 
     async def broadcast_uncompact_blocks(
-        self, uncompact_interval_scan: int, target_uncompact_proofs: int, sanitize_weight_proof_only: bool
-    ):
+            self, uncompact_interval_scan: int, target_uncompact_proofs: int, sanitize_weight_proof_only: bool
+    ) -> None:
         try:
             while not self._shut_down:
-                while self.sync_store.get_sync_mode():
+                while self.sync_store.get_sync_mode() or self.sync_store.get_long_sync():
                     if self._shut_down:
                         return None
                     await asyncio.sleep(30)
@@ -2242,7 +2820,6 @@ class FullNode:
                 self.log.info("Heights found for bluebox to compact: [%s]" % ", ".join(map(str, heights)))
 
                 for h in heights:
-
                     headers = await self.blockchain.get_header_blocks_in_range(h, h, tx_filter=False)
                     records: Dict[bytes32, BlockRecord] = {}
                     if sanitize_weight_proof_only:
@@ -2256,8 +2833,8 @@ class FullNode:
                             record = records[header.header_hash]
                         for sub_slot in header.finished_sub_slots:
                             if (
-                                sub_slot.proofs.challenge_chain_slot_proof.witness_type > 0
-                                or not sub_slot.proofs.challenge_chain_slot_proof.normalized_to_identity
+                                    sub_slot.proofs.challenge_chain_slot_proof.witness_type > 0
+                                    or not sub_slot.proofs.challenge_chain_slot_proof.normalized_to_identity
                             ):
                                 broadcast_list.append(
                                     timelord_protocol.RequestCompactProofOfTime(
@@ -2268,8 +2845,8 @@ class FullNode:
                                     )
                                 )
                             if sub_slot.proofs.infused_challenge_chain_slot_proof is not None and (
-                                sub_slot.proofs.infused_challenge_chain_slot_proof.witness_type > 0
-                                or not sub_slot.proofs.infused_challenge_chain_slot_proof.normalized_to_identity
+                                    sub_slot.proofs.infused_challenge_chain_slot_proof.witness_type > 0
+                                    or not sub_slot.proofs.infused_challenge_chain_slot_proof.normalized_to_identity
                             ):
                                 assert sub_slot.infused_challenge_chain is not None
                                 broadcast_list.append(
@@ -2286,8 +2863,8 @@ class FullNode:
                             if not record.is_challenge_block(self.constants):
                                 continue
                         if header.challenge_chain_sp_proof is not None and (
-                            header.challenge_chain_sp_proof.witness_type > 0
-                            or not header.challenge_chain_sp_proof.normalized_to_identity
+                                header.challenge_chain_sp_proof.witness_type > 0
+                                or not header.challenge_chain_sp_proof.normalized_to_identity
                         ):
                             assert header.reward_chain_block.challenge_chain_sp_vdf is not None
                             broadcast_list.append(
@@ -2300,8 +2877,8 @@ class FullNode:
                             )
 
                         if (
-                            header.challenge_chain_ip_proof.witness_type > 0
-                            or not header.challenge_chain_ip_proof.normalized_to_identity
+                                header.challenge_chain_ip_proof.witness_type > 0
+                                or not header.challenge_chain_ip_proof.normalized_to_identity
                         ):
                             broadcast_list.append(
                                 timelord_protocol.RequestCompactProofOfTime(
@@ -2314,9 +2891,9 @@ class FullNode:
 
                 if len(broadcast_list) > target_uncompact_proofs:
                     broadcast_list = broadcast_list[:target_uncompact_proofs]
-                if self.sync_store.get_sync_mode():
+                if self.sync_store.get_sync_mode() or self.sync_store.get_long_sync():
                     continue
-                if self.server is not None:
+                if self._server is not None:
                     self.log.info(f"Broadcasting {len(broadcast_list)} items to the bluebox")
                     msgs = []
                     for new_pot in broadcast_list:
@@ -2331,10 +2908,11 @@ class FullNode:
 
 
 async def node_next_block_check(
-    peer: ws.WSChiaConnection, potential_peek: uint32, blockchain: BlockchainInterface
+        peer: WSGoldConnection, potential_peek: uint32, blockchain: BlockchainInterface
 ) -> bool:
-
-    block_response: Optional[Any] = await peer.request_block(full_node_protocol.RequestBlock(potential_peek, True))
+    block_response: Optional[Any] = await peer.call_api(
+        FullNodeAPI.request_block, full_node_protocol.RequestBlock(potential_peek, True)
+    )
     if block_response is not None and isinstance(block_response, full_node_protocol.RespondBlock):
         peak = blockchain.get_peak()
         if peak is not None and block_response.block.prev_header_hash == peak.header_hash:
